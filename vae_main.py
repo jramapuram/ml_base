@@ -14,7 +14,7 @@ from collections import namedtuple
 from copy import deepcopy
 from torchvision import transforms
 
-from movels.vae.vrnn import VRNN
+from models.vae.vrnn import VRNN
 from models.vae.parallelly_reparameterized_vae import ParallellyReparameterizedVAE
 from models.vae.sequentially_reparameterized_vae import SequentiallyReparameterizedVAE
 
@@ -80,6 +80,16 @@ parser.add_argument('--disable-gated', action='store_true', default=False,
 parser.add_argument('--model-dir', type=str, default='.models',
                     help='directory which contains saved models (default: .models)')
 
+# RNN Related
+parser.add_argument('--clip', type=float, default=0,
+                    help='gradient clipping for RNN (default: 0.25)')
+parser.add_argument('--use-prior-kl', action='store_true',
+                    help='add a kl on the VRNN prior against the true prior (default: False)')
+parser.add_argument('--use-noisy-rnn-state', action='store_true',
+                    help='uses a noisy initial rnn state instead of zeros (default: False)')
+parser.add_argument('--max-time-steps', type=int, default=4,
+                    help='max time steps for RNN (default: 4)')
+
 # Regularizer
 parser.add_argument('--kl-beta', type=float, default=1, help='beta-vae kl term (default: 1)')
 parser.add_argument('--conv-normalization', type=str, default='groupnorm',
@@ -88,9 +98,9 @@ parser.add_argument('--dense-normalization', type=str, default='batchnorm',
                     help='normalization type: batchnorm/instancenorm/none (default: batchnorm)')
 
 # Metrics
-parser.add_argument('--calculate-msssim', type=b, default=None,
+parser.add_argument('--calculate-msssim', action='store_true', default=False,
                     help='enables FID calc & uses model conv/inceptionv3  (default: None)')
-parser.add_argument('--calculate-fid-with', action='store_true', default=False,
+parser.add_argument('--calculate-fid-with', type=str, default=None,
                     help='calculated the multi-scale structural similarity (default: False)')
 
 # Optimization related
@@ -172,6 +182,7 @@ def build_loader_model_grapher(args, transform=None):
         'vrnn': VRNN
     }
     network = vae_dict[args.vae_type](loader.img_shp, kwargs=deepcopy(vars(args)))
+    lazy_generate_modules(network, loader.train_loader)
     network = network.cuda() if args.cuda else network
     network = append_save_and_load_fns(network, prefix="VAE_")
     if args.ngpu > 1:
@@ -184,6 +195,27 @@ def build_loader_model_grapher(args, transform=None):
                       port=args.visdom_port)
 
     return loader, network, grapher
+
+
+def lazy_generate_modules(model, loader):
+    """ A helper to build the modules that are lazily compiled
+
+    :param model: the nn.Module
+    :param loader: the dataloader
+    :returns: None
+    :rtype: None
+
+    """
+    model.eval()
+    model.config['half'] = False # disable half here due to CPU weights
+    for minibatch, labels in loader:
+        with torch.no_grad():
+            _ = model(minibatch)
+            break
+
+    # reset half tensors if requested since torch.cuda.HalfTensor has impls
+    model.config['half'] = args.half
+
 
 
 def register_plots(loss, grapher, epoch, prefix='train'):
@@ -441,4 +473,5 @@ def run(args):
 
 
 if __name__ == "__main__":
+    print(pprint.PrettyPrinter(indent=4).pformat(vars(args)))
     run(args)
