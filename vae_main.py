@@ -1,6 +1,5 @@
 import os
 import time
-import functools
 import argparse
 import pprint
 import torch
@@ -10,7 +9,6 @@ import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
 
-from collections import namedtuple
 from copy import deepcopy
 from torchvision import transforms
 
@@ -25,7 +23,7 @@ from helpers.metrics import softmax_accuracy, bce_accuracy, \
 from helpers.grapher import Grapher
 from helpers.layers import EarlyStopping, append_save_and_load_fns
 from helpers.utils import dummy_context, ones_like, get_name, \
-    one_hot, float_type, long_type, append_to_csv, check_or_create_dir
+    append_to_csv, check_or_create_dir
 from helpers.fid import train_fid_model
 
 
@@ -362,7 +360,7 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
             if args.clip > 0:
                 # TODO: clip by value or norm? torch.nn.utils.clip_grad_value_
                 # torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip) \
-                torch.nn.utils.clip_grad_value_(model.parameters(), args.clip) \
+                nn.utils.clip_grad_value_(model.parameters(), args.clip) \
                     if not args.half else optimizer.clip_master_grads(args.clip)
 
             optimizer.step()

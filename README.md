@@ -16,6 +16,12 @@ git remote set-url origin git+ssh://git@github.com/YOUR_USERNAME/YOUR_PROJECT.gi
 git push -f                                                                          # push to new remote
 ```
 
+#### Example resnet18 classifier project
+
+``` bash
+python main.py --task=mnist
+```
+
 
 ## Usage VAE Project
 
