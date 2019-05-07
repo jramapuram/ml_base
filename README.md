@@ -8,12 +8,12 @@ ml_base is intended to be used as a starting point for quick prototyping of Vari
 First go create your repository to house your project (`github.com/YOUR_USERNAME/YOUR_PROJECT.git` below).
 
 ``` bash
-git clone recursive git+ssh://git@github.com/jramapuram/ml_base.git                # clone the repo
-git remote set-url origin git+ssh://git@github.com/YOUR_USERNAME/YOUR_PROJECT.git  # change the endpoint
+git clone --recursive git+ssh://git@github.com/jramapuram/ml_base.git                # clone the repo
+git remote set-url origin git+ssh://git@github.com/YOUR_USERNAME/YOUR_PROJECT.git    # change the endpoint
 
 # Prototype the idea you want
 
-git push -f                                                                        # push to new remote
+git push -f                                                                          # push to new remote
 ```
 
 
@@ -22,13 +22,13 @@ git push -f                                                                     
 First go create your repository to house your project (`github.com/YOUR_USERNAME/YOUR_PROJECT.git` below).
 
 ``` bash
-git clone recursive git+ssh://git@github.com/jramapuram/ml_base.git                # clone the repo
-git clone recursive git+ssh://git@github.com/jramapuram/vae.git models             # clone the VAE repo
-git remote set-url origin git+ssh://git@github.com/YOUR_USERNAME/YOUR_PROJECT.git  # change the endpoint
+git clone --recursive git+ssh://git@github.com/jramapuram/ml_base.git                # clone the repo
+git clone --recursive git+ssh://git@github.com/jramapuram/vae.git models/vae         # clone the VAE repo (consider sub-moduling)
+git remote set-url origin git+ssh://git@github.com/YOUR_USERNAME/YOUR_PROJECT.git    # change the endpoint
 
 # Prototype the idea you want
 
-git push -f                                                                        # push to new remote
+git push -f                                                                          # push to new remote
 ```
 
 
