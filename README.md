@@ -19,7 +19,7 @@ git push -f                                                                     
 #### Example resnet18 classifier project
 
 ``` bash
-python main.py --task=mnist
+python main.py --task=cifar10
 ```
 
 
