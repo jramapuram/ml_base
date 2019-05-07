@@ -15,13 +15,13 @@ from copy import deepcopy
 from torchvision import transforms
 
 from models.vae.vrnn import VRNN
+from models.vae.simple_vae import SimpleVAE
 from models.vae.parallelly_reparameterized_vae import ParallellyReparameterizedVAE
 from models.vae.sequentially_reparameterized_vae import SequentiallyReparameterizedVAE
 
 from datasets.loader import get_loader
 from helpers.metrics import softmax_accuracy, bce_accuracy, \
     softmax_correct, all_or_none_accuracy, calculate_fid, calculate_mssim
-from helpers.distributions import nll_activation
 from helpers.grapher import Grapher
 from helpers.layers import EarlyStopping, append_save_and_load_fns
 from helpers.utils import dummy_context, ones_like, get_name, \
@@ -96,6 +96,8 @@ parser.add_argument('--conv-normalization', type=str, default='groupnorm',
                     help='normalization type: batchnorm/groupnorm/instancenorm/none (default: groupnorm)')
 parser.add_argument('--dense-normalization', type=str, default='batchnorm',
                     help='normalization type: batchnorm/instancenorm/none (default: batchnorm)')
+parser.add_argument('--add-img-noise', action='store_true', default=False,
+                    help='add scattered noise to  images (default: False)')
 
 # Metrics
 parser.add_argument('--calculate-msssim', action='store_true', default=False,
@@ -177,6 +179,7 @@ def build_loader_model_grapher(args, transform=None):
 
     # build the network
     vae_dict = {
+        'simple': SimpleVAE,
         'parallel': ParallellyReparameterizedVAE,
         'sequential': SequentiallyReparameterizedVAE,
         'vrnn': VRNN
@@ -188,6 +191,8 @@ def build_loader_model_grapher(args, transform=None):
     if args.ngpu > 1:
         print("data-paralleling...")
         network.parallel()
+
+    # print(network)
 
     # build the grapher object
     grapher = Grapher('visdom', env=get_name(args),
@@ -373,8 +378,8 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
         loss_map['loss_mean'].item(),
         loss_map['kld_mean'].item()))
 
-    # activate the logits of the reconstruction
-    reconstr_image = nll_activation(pred_logits, args.nll_type)
+    # activate the logits of the reconstruction and get the dict
+    reconstr_map = model.get_activated_reconstructions(pred_logits)
 
     # tack on MSSIM information if requested
     if args.calculate_msssim:
@@ -390,10 +395,9 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     generated = model.generate_synthetic_samples(args.batch_size)
     image_map = {
         'input_imgs': F.upsample(minibatch, (100, 100)) if args.task == 'image_folder' else minibatch,
-        'reconstruction_imgs': F.upsample(reconstr_image, (100, 100)) if args.task == 'image_folder' else reconstr_image,
         'generated_imgs': F.upsample(generated, (100, 100)) if args.task == 'image_folder' else generated,
     }
-    register_images(image_map, grapher, prefix=prefix)
+    register_images({**image_map, **reconstr_map}, grapher, prefix=prefix)
     grapher.save()
 
     # cleanups (see https://tinyurl.com/ycjre67m) + return ELBO for early stopping
