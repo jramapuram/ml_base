@@ -371,10 +371,13 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
 
     # compute the mean of the map
     loss_map = _mean_map(loss_map) # reduce the map to get actual means
-    print('{}[Epoch {}][{} samples][{:.2f} sec]: -ELBO: {:.4f}\tKLD: {:.4f}'.format(
+    print('{}[Epoch {}][{} samples][{:.2f} sec]:\t Loss: {:.4f}\t-ELBO: {:.4f}\tNLL: {:.4f}\tKLD: {:.4f}\tMI: {:.4f}'.format(
         prefix, epoch, num_samples, time.time() - start_time,
         loss_map['loss_mean'].item(),
-        loss_map['kld_mean'].item()))
+        loss_map['elbo_mean'].item(),
+        loss_map['nll_mean'].item(),
+        loss_map['kld_mean'].item(),
+        loss_map['mut_info_mean'].item()))
 
     # activate the logits of the reconstruction and get the dict
     reconstr_map = model.get_activated_reconstructions(pred_logits)
@@ -390,7 +393,7 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     register_plots({**loss_map, **reparam_scalars}, grapher, epoch=epoch, prefix=prefix)
 
     # tack on images to grapher
-    generated = model.generate_synthetic_samples(args.batch_size)
+    generated = model.generate_synthetic_samples(args.batch_size, reset_state=True)
     image_map = {
         'input_imgs': F.upsample(minibatch, (100, 100)) if args.task == 'image_folder' else minibatch,
         'generated_imgs': F.upsample(generated, (100, 100)) if args.task == 'image_folder' else generated,
