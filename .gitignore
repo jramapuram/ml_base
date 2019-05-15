@@ -100,5 +100,9 @@ ENV/
 # mypy
 .mypy_cache/
 
+# osx
+.DS_Store
+
 # datasets
 .datasets/
+runs
