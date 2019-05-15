@@ -5,6 +5,7 @@ import time
 import torch
 import pprint
 import argparse
+import torchvision
 import numpy as np
 import torch.optim as optim
 import torch.nn.functional as F
@@ -33,16 +34,18 @@ parser.add_argument('--epochs', type=int, default=3000, metavar='N',
                     help='minimum number of epochs to train (default: 10000)')
 parser.add_argument('--download', type=int, default=1,
                     help='download dataset from s3 (default: 1)')
+parser.add_argument('--image-size-override', type=int, default=224,
+                    help='Override and force resizing of images to this specific size (default: 224)')
 parser.add_argument('--data-dir', type=str, default='./.datasets', metavar='DD',
                     help='directory which contains input data')
 parser.add_argument('--uid', type=str, default="",
                     help='uid for current session (default: empty-str)')
 
 # Visdom parameters
-parser.add_argument('--visdom-url', type=str, default="http://localhost",
-                    help='visdom URL for graphs (default: http://localhost)')
-parser.add_argument('--visdom-port', type=int, default="8097",
-                    help='visdom port for graphs (default: 8097)')
+parser.add_argument('--visdom-url', type=str, default=None,
+                    help='visdom URL for graphs, needs http://url (default: None)')
+parser.add_argument('--visdom-port', type=int, default=None,
+                    help='visdom port for graphs (default: None)')
 
 # Optimization related
 parser.add_argument('--lr', type=float, default=1e-3, metavar='LR',
@@ -98,7 +101,7 @@ def build_optimizer(model):
     )
 
 
-def build_loader_model_grapher(args, transforms=None):
+def build_loader_model_grapher(args):
     """builds a model, a dataloader and a grapher
 
     :param args: argparse
@@ -107,7 +110,12 @@ def build_loader_model_grapher(args, transforms=None):
     :rtype: list
 
     """
-    loader = get_loader(args, transform=transforms, **vars(args))  # build the loader
+    resize_shape = (args.image_size_override, args.image_size_override)
+    transform = [transforms.Resize(resize_shape)] \
+        if args.image_size_override else None
+    loader = get_loader(args, transform=transform, **vars(args))  # build the loader
+    args.input_shape = loader.img_shp if args.image_size_override is None \
+        else [loader.img_shp[0], *resize_shape]                   # set the input size
 
     # build the network; to use your own model import and construct it here
     network = resnet18(num_classes=loader.output_size)
@@ -118,12 +126,13 @@ def build_loader_model_grapher(args, transforms=None):
         print("data-paralleling...")
         network.parallel()
 
-    # print(network)
-
     # build the grapher object
-    grapher = Grapher('visdom', env=get_name(args),
-                      server=args.visdom_url,
-                      port=args.visdom_port)
+    if args.visdom_url:
+        grapher = Grapher('visdom', env=get_name(args),
+                          server=args.visdom_url,
+                          port=args.visdom_port)
+    else:
+        grapher = Grapher('tensorboard', comment=get_name(args))
 
     return loader, network, grapher
 
@@ -181,11 +190,10 @@ def register_images(output_map, grapher, prefix='train'):
 
         if 'img' in k or 'imgs' in k:
             key_name = '-'.join(k.split('_')[0:-1])
-            img = torch.min(v/v.max(), torch.ones_like(v))
+            img = torchvision.utils.make_grid(v, normalize=True, scale_each=True)
             grapher.add_image('{}_{}'.format(prefix, key_name),
                               img.detach(),
                               global_step=0) # dont use step
-
 
 def _add_loss_map(loss_tm1, loss_t):
     """ Adds the current dict _t to the previous running dict _tm1
@@ -336,8 +344,7 @@ def run(args):
     :rtype: None
 
     """
-    loader, model, grapher = build_loader_model_grapher(
-        args, transforms=[transforms.Resize((224, 224))])       # build the model, loader and grapher
+    loader, model, grapher = build_loader_model_grapher(args)   # build the model, loader and grapher
     optimizer = build_optimizer(model)                          # the optimizer for the vae
     early = EarlyStopping(model, max_steps=200,                 # the early-stopping object
                           burn_in_interval=int(args.epochs*0.2)) if args.early_stop else None
@@ -352,8 +359,7 @@ def run(args):
             break
 
         if epoch == 2: # make sure we do at least 1 test and train pass
-            grapher.add_text('config', pprint.PrettyPrinter(indent=4).pformat(vars(args)),
-                             0, append=True)
+            grapher.add_text('config', pprint.PrettyPrinter(indent=4).pformat(vars(args)),0)# , append=True)
 
     # cleanups
     grapher.close()
