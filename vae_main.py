@@ -13,6 +13,7 @@ from copy import deepcopy
 from torchvision import transforms
 
 from models.vae.vrnn import VRNN
+from models.vae.msg import MSGVAE
 from models.vae.simple_vae import SimpleVAE
 from models.vae.parallelly_reparameterized_vae import ParallellyReparameterizedVAE
 from models.vae.sequentially_reparameterized_vae import SequentiallyReparameterizedVAE
@@ -47,8 +48,8 @@ parser.add_argument('--uid', type=str, default="",
                     help='uid for current session (default: empty-str)')
 
 # VAE related
-parser.add_argument('--vae-type', type=str, default='parallel',
-                    help='parallel, sequential or vrnn (default: parallel)')
+parser.add_argument('--vae-type', type=str, default='simple',
+                    help='parallel, sequential, vrnn, simple, msg (default: simple)')
 parser.add_argument('--nll-type', type=str, default='bernoulli',
                     help='bernoulli or gaussian (default: bernoulli)')
 parser.add_argument('--reparam-type', type=str, default='isotropic_gaussian',
@@ -63,6 +64,8 @@ parser.add_argument('--discrete-mut-info', type=float, default=0.0,
                     help='+discrete_mut_info * I(z_d; x) is applied (default: 0.0)')
 parser.add_argument('--generative-scale-var', type=float, default=1.0,
                     help='scale variance of prior in order to capture outliers')
+parser.add_argument('--use-aggregate-posterior', action='store_true', default=False,
+                    help='uses aggregate posterior for generation (default: False)')
 
 # Model
 parser.add_argument('--encoder-layer-type', type=str, default='conv',
@@ -89,6 +92,10 @@ parser.add_argument('--use-noisy-rnn-state', action='store_true',
                     help='uses a noisy initial rnn state instead of zeros (default: False)')
 parser.add_argument('--max-time-steps', type=int, default=4,
                     help='max time steps for RNN (default: 4)')
+parser.add_argument('--mut-clamp-strategy', type=str, default="clamp",
+                    help='clamp mut info by norm / clamp / none (default: clamp)')
+parser.add_argument('--mut-clamp-value', type=float, default=100.0,
+                    help='max / min clamp value if above strategy is clamp (default: 100.0)')
 
 # Regularizer
 parser.add_argument('--kl-beta', type=float, default=1, help='beta-vae kl term (default: 1)')
@@ -185,6 +192,7 @@ def build_loader_model_grapher(args):
     # build the network
     vae_dict = {
         'simple': SimpleVAE,
+        'msg': MSGVAE,
         'parallel': ParallellyReparameterizedVAE,
         'sequential': SequentiallyReparameterizedVAE,
         'vrnn': VRNN
@@ -401,12 +409,19 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     # plot the test accuracy, loss and images
     register_plots({**loss_map, **reparam_scalars}, grapher, epoch=epoch, prefix=prefix)
 
+    # get some generations, only do once in a while for pixelcnn
+    generated = None
+    if args.decoder_layer_type == 'pixelcnn' and epoch % 10 != 0:
+        generated = model.generate_synthetic_samples(args.batch_size, reset_state=True,
+                                                     use_aggregate_posterior=args.use_aggregate_posterior)
+
     # tack on images to grapher
-    generated = model.generate_synthetic_samples(args.batch_size, reset_state=True)
     image_map = {
-        'input_imgs': F.upsample(minibatch, (100, 100)) if args.task == 'image_folder' else minibatch,
-        'generated_imgs': F.upsample(generated, (100, 100)) if args.task == 'image_folder' else generated,
+        'input_imgs': F.upsample(minibatch, (100, 100)) if args.task == 'image_folder' else minibatch
     }
+    if generated:
+        image_map['generated_imgs'] = F.upsample(generated, (100, 100)) if args.task == 'image_folder' else generated
+
     register_images({**image_map, **reconstr_map}, grapher, prefix=prefix)
     grapher.save()
 
