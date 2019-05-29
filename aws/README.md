@@ -21,7 +21,7 @@ The spot feature of this code does the following:
 The following will train a fashion VAE on an AWS spot instance.
 
 ``` bash
-(base) ➜  aws git:(feature/numerical_grads) ✗ python spawn.py --instance-type=p3.2xlarge --number-of-instances=1 --upper-bound-spot-multiplier=1.2 --cmd=run_test.sh
+➜ python spawn.py --instance-type=p3.2xlarge --number-of-instances=1 --upper-bound-spot-multiplier=1.2 --cmd=run_test.sh
 {   'ami': 'ami-0af8dc9d28a9aed78',
     'cmd': 'run_test.sh',
     'instance_region': 'us-east-1',
