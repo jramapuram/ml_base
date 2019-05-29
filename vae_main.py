@@ -213,7 +213,6 @@ def build_loader_model_grapher(args):
     else:
         grapher = Grapher('tensorboard', comment=get_name(args))
 
-
     return loader, network, grapher
 
 
@@ -411,7 +410,10 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
 
     # get some generations, only do once in a while for pixelcnn
     generated = None
-    if args.decoder_layer_type == 'pixelcnn' and epoch % 10 != 0:
+    if args.decoder_layer_type == 'pixelcnn' and epoch % 10 == 0:
+        generated = model.generate_synthetic_samples(args.batch_size, reset_state=True,
+                                                     use_aggregate_posterior=args.use_aggregate_posterior)
+    elif args.decoder_layer_type != 'pixelcnn':
         generated = model.generate_synthetic_samples(args.batch_size, reset_state=True,
                                                      use_aggregate_posterior=args.use_aggregate_posterior)
 
@@ -419,8 +421,9 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     image_map = {
         'input_imgs': F.upsample(minibatch, (100, 100)) if args.task == 'image_folder' else minibatch
     }
-    if generated:
-        image_map['generated_imgs'] = F.upsample(generated, (100, 100)) if args.task == 'image_folder' else generated
+    if generated is not None:
+        image_map['generated_imgs'] = F.upsample(generated, (100, 100)) \
+            if args.task == 'image_folder' else generated
 
     register_images({**image_map, **reconstr_map}, grapher, prefix=prefix)
     grapher.save()
