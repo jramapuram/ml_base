@@ -12,12 +12,7 @@ import numpy as np
 from copy import deepcopy
 from torchvision import transforms
 
-from models.vae.vrnn import VRNN
-from models.vae.msg import MSGVAE
-from models.vae.simple_vae import SimpleVAE
-from models.vae.parallelly_reparameterized_vae import ParallellyReparameterizedVAE
-from models.vae.sequentially_reparameterized_vae import SequentiallyReparameterizedVAE
-
+from models.vae import build_vae
 from datasets.loader import get_loader
 from helpers.metrics import softmax_accuracy, bce_accuracy, \
     softmax_correct, all_or_none_accuracy, calculate_fid, calculate_mssim
@@ -143,6 +138,11 @@ args.cuda = not args.no_cuda and torch.cuda.is_available()
 if args.cuda:
     torch.backends.cudnn.benchmark = True
 
+# import half-precision imports
+if args.half:
+    from apex.parallel import DistributedDataParallel as DDP
+    from apex.fp16_utils import *
+    from apex import amp, optimizers
 
 # set a fixed seed for GPUs and CPU
 if args.seed is not None:
@@ -190,16 +190,12 @@ def build_loader_model_grapher(args):
         else [loader.img_shp[0], *resize_shape]                   # set the input size
 
     # build the network
-    vae_dict = {
-        'simple': SimpleVAE,
-        'msg': MSGVAE,
-        'parallel': ParallellyReparameterizedVAE,
-        'sequential': SequentiallyReparameterizedVAE,
-        'vrnn': VRNN
-    }
-    network = vae_dict[args.vae_type](loader.img_shp, kwargs=deepcopy(vars(args)))
+    network = build_vae(args.vae_type)(loader.img_shp, kwargs=deepcopy(vars(args)))
     lazy_generate_modules(network, loader.train_loader)
     network = network.cuda() if args.cuda else network
+    # if args.half: # done below with amp
+    #     network.fp16()
+
     network = append_save_and_load_fns(network, prefix="VAE_")
     if args.ngpu > 1:
         print("data-paralleling...")
@@ -234,7 +230,6 @@ def lazy_generate_modules(model, loader):
 
     # reset half tensors if requested since torch.cuda.HalfTensor has impls
     model.config['half'] = args.half
-
 
 
 def register_plots(loss, grapher, epoch, prefix='train'):
@@ -366,10 +361,10 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
 
         if 'train' in prefix: # compute bp and optimize
             if args.half:
-                optimizer.backward(loss_t['loss_mean'])
-                # with amp_handle.scale_loss(loss_t['loss_mean'], optimizer,
-                #                            dynamic_loss_scale=True) as scaled_loss:
-                #     scaled_loss.backward()
+                #optimizer.backward(loss_t['loss_mean'])
+                with amp_handle.scale_loss(loss_t['loss_mean'], optimizer,
+                                           dynamic_loss_scale=True) as scaled_loss:
+                    scaled_loss.backward()
             else:
                 loss_t['loss_mean'].backward()
 
@@ -475,6 +470,9 @@ def run(args):
     """
     loader, model, grapher = build_loader_model_grapher(args)   # build the model, loader and grapher
     optimizer = build_optimizer(model)                          # the optimizer for the vae
+    if args.half:
+        model, optimizer = amp.initialize(model, optimizer, opt_level="O1")
+
     early = EarlyStopping(model, max_steps=200,                 # the early-stopping object
                           burn_in_interval=int(args.epochs*0.2)) if args.early_stop else None
     fid_model = train_fid_model(args, fid_type=args.calculate_fid_with, batch_size=32) \

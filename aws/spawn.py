@@ -61,13 +61,22 @@ def get_all_availability_zones(client):
 def get_cheapest_price(args):
     ''' gets the cheapest current AWS spot price, returns price and zone'''
     client = boto3.client('ec2', region_name=args.instance_region)
-    price = client.describe_spot_price_history(
+    price_dict = client.describe_spot_price_history(
         InstanceTypes=[args.instance_type],
-        MaxResults=1,
+        MaxResults=8,
         ProductDescriptions=['Linux/UNIX (Amazon VPC)']# ,
     )
-    cheapest_price = float(price['SpotPriceHistory'][0]['SpotPrice'])
-    cheapest_zone = price['SpotPriceHistory'][0]['AvailabilityZone']
+
+    # iterate through and get the cheapest zone
+    cheapest_price = np.inf
+    cheapest_zone = ""
+    for price in price_dict['SpotPriceHistory']:
+        cheapest_price_i = float(price['SpotPrice'])
+        cheapest_zone_i = price['AvailabilityZone']
+
+        if cheapest_price_i < cheapest_price:
+            cheapest_price = cheapest_price_i
+            cheapest_zone = cheapest_zone_i
 
     # sanity checks
     assert cheapest_price is not None and cheapest_price < np.inf, "cheapest price was not determined"
@@ -174,8 +183,8 @@ def create_spot(args):
         max_price = cheapest_price * args.upper_bound_spot_multiplier
         print("setting max price to {}".format(max_price))
 
-        #zone_override = cheapest_zone if args.instance_zone is None else args.instance_zone
-        zone_override = None if args.instance_zone is None else args.instance_zone
+        zone_override = cheapest_zone if args.instance_zone is None else args.instance_zone
+        #zone_override = None if args.instance_zone is None else args.instance_zone
         launch_spec_dict = get_launch_spec(args, zone_override)
 
         # request the node(s)
