@@ -20,8 +20,10 @@ parser.add_argument('--instance-type', type=str, default="p3.2xlarge",
                     help="instance type (default: p3.2xlarge)")
 parser.add_argument('--number-of-instances', type=int, default=1,
                     help="number of instances to spawn (default: 1)")
-parser.add_argument('--storage-size', type=int, default=150,
-                    help="storage in GiB (default: 150)")
+parser.add_argument('--storage-size', type=int, default=None,
+                    help="storage in GiB (default: None)")
+parser.add_argument('--storage-iops', type=int, default=None,
+                    help="storage IOPS, max of 5000 (default: None)")
 parser.add_argument('--keypair', type=str, default="aws",
                     help="keypair name (default: aws)")
 parser.add_argument('--security-group', type=str, default="default",
@@ -85,6 +87,7 @@ def get_cheapest_price(args):
     # return price and zone
     print("found cheapest price of {}$ in zone {}".format(cheapest_price, cheapest_zone))
     return cheapest_price, cheapest_zone
+
 
 def attach_tag(instance_list, tag=None):
     if tag is not None:
@@ -150,11 +153,12 @@ def get_launch_spec(args, custom_zone=None):
         'Ebs':{
             'DeleteOnTermination': True,
             'VolumeType': 'io1',
-            'Iops': 5000,
+            'Iops': args.storage_iops,
+            # 'Iops': 5000, # fast version
             # 'VolumeType': 'gp2',
             'VolumeSize': args.storage_size
         }
-    }
+    } if args.storage_size is not None else {}
 
     # create the launch spec dict
     launch_spec_dict = {
@@ -162,11 +166,13 @@ def get_launch_spec(args, custom_zone=None):
         'ImageId': args.ami,
         'KeyName': args.keypair,
         'InstanceType': args.instance_type,
-        'BlockDeviceMappings': [storage_dict],
         'IamInstanceProfile': {
             'Name': args.s3_iam
         }
     }
+
+    if storage_dict:
+        launch_spec_dict['BlockDeviceMappings'] = [storage_dict]
 
     if custom_zone is not None:
         launch_spec_dict['Placement'] = {
@@ -193,7 +199,8 @@ def create_spot(args):
             Type='one-time',
             InstanceInterruptionBehavior='terminate',
             #InstanceInitiatedShutdownBehavior='terminate',
-            InstanceCount=args.number_of_instances,
+            # InstanceCount=args.number_of_instances,
+            InstanceCount=1,
             LaunchSpecification=launch_spec_dict
         )
         time.sleep(10) # XXX: sometimes remote doesn't update fast enough
@@ -207,7 +214,8 @@ def create_spot(args):
         instances, all_instances_created = [], False
         total_waited_time, wait_interval = 0, 5
         max_time_to_wait = 600 / wait_interval # 10 min = 600s / [5s interval] = 120 counts
-        print("creating {} instances, please be patient.".format(args.number_of_instances), end='', flush=True)
+        #print("creating {} instances, please be patient.".format(args.number_of_instances), end='', flush=True)
+        print("creating instance, please be patient.", end='', flush=True)
 
         while not all_instances_created:
             spot_req_response = client.describe_spot_instance_requests(
@@ -231,8 +239,8 @@ def create_spot(args):
                 # add the instance to the list of created instances
                 instance_id = spot_req['InstanceId']
                 instances.append(instance_id)
-                if len(instances) == args.number_of_instances:
-                    print("successfully created {} instances".format(len(instances)))
+                if len(instances) == 1:
+                    print("successfully created {} instance".format(len(instances)))
                     all_instances_created = True
 
         attach_tag(instances, tag=args.uid)
@@ -248,8 +256,10 @@ def create_ondemand(args):
         ec2 = boto3.resource('ec2', region_name=args.instance_region)
         #subnet = ec2.Subnet(args.subnet) if args.subnet is not None else ec2.Subnet()
         instances = ec2.create_instances(
-            MaxCount=args.number_of_instances,
-            MinCount=args.number_of_instances,
+            # MaxCount=args.number_of_instances,
+            # MinCount=args.number_of_instances,
+            MaxCount=1,
+            MinCount=1,
             **get_launch_spec(args)
         )
 
