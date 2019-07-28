@@ -71,6 +71,10 @@ args.cuda = not args.no_cuda and torch.cuda.is_available()
 if args.cuda:
     torch.backends.cudnn.benchmark = True
 
+# add aws job ID to config if it exists
+aws_instance_id = get_aws_instance_id()
+if aws_instance_id is not None:
+    args.instance_id = aws_instance_id
 
 # set a fixed seed for GPUs and CPU
 if args.seed is not None:

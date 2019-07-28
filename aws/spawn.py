@@ -104,7 +104,7 @@ def get_git_root():
 
 def tar_current_project():
     ''' helper to zip the root of this git-dir'''
-    output_filename="project_{}.tar.gz".format(uuid.uuid4().hex)
+    output_filename = os.path.join("/tmp", "project_{}.tar.gz".format(uuid.uuid4().hex))
     print("compressing current git repo for deployment...", end='', flush=True)
     source_dir = get_git_root()
     with tarfile.open(output_filename, "w:gz") as tar:
@@ -198,9 +198,7 @@ def create_spot(args):
             SpotPrice=str(max_price),
             Type='one-time',
             InstanceInterruptionBehavior='terminate',
-            #InstanceInitiatedShutdownBehavior='terminate',
-            # InstanceCount=args.number_of_instances,
-            InstanceCount=1,
+            InstanceCount=args.number_of_instances,
             LaunchSpecification=launch_spec_dict
         )
         time.sleep(10) # XXX: sometimes remote doesn't update fast enough
@@ -214,8 +212,8 @@ def create_spot(args):
         instances, all_instances_created = [], False
         total_waited_time, wait_interval = 0, 5
         max_time_to_wait = 600 / wait_interval # 10 min = 600s / [5s interval] = 120 counts
-        #print("creating {} instances, please be patient.".format(args.number_of_instances), end='', flush=True)
-        print("creating instance, please be patient.", end='', flush=True)
+        print("creating {} instances, please be patient.".format(args.number_of_instances), end='', flush=True)
+        #print("creating instance, please be patient.", end='', flush=True)
 
         while not all_instances_created:
             spot_req_response = client.describe_spot_instance_requests(
@@ -256,10 +254,9 @@ def create_ondemand(args):
         ec2 = boto3.resource('ec2', region_name=args.instance_region)
         #subnet = ec2.Subnet(args.subnet) if args.subnet is not None else ec2.Subnet()
         instances = ec2.create_instances(
-            # MaxCount=args.number_of_instances,
-            # MinCount=args.number_of_instances,
-            MaxCount=1,
-            MinCount=1,
+            MaxCount=args.number_of_instances,
+            MinCount=args.number_of_instances,
+            InstanceInitiatedShutdownBehavior='terminate',
             **get_launch_spec(args)
         )
 
@@ -316,8 +313,7 @@ def run_command(cmd, hostname, pem_file, username='ubuntu',
     # send all files from current directory to remote server
     all_files = [local_file for local_file in os.listdir(".")
                  if local_file == 'setup.sh'
-                 or local_file == orig_cmd
-                 or local_file == project_filename]
+                 or local_file == orig_cmd] + [project_filename]
     print("transferring {} to host {}".format(all_files, hostname))
     for local_file in all_files:
         remote_file = os.path.join("/tmp", os.path.basename(local_file))
@@ -365,21 +361,21 @@ def main(args):
         print("creating on-demand instance")
         instance_ips = create_ondemand(args)
 
-    # run the specified command over ssh
-    # also append shutdown command to terminate
-    pem_file_path = os.path.join(os.path.expanduser('~'), ".ssh", args.keypair + ".pem")
-    for instance_ip in instance_ips:
+    def run_command_on_remote(instance_ip):
+        # run the specified command over ssh
+        # also append shutdown command to terminate
+        pem_file_path = os.path.join(os.path.expanduser('~'), ".ssh", args.keypair + ".pem")
         cli_out = run_command(args.cmd, instance_ip, pem_file_path,
                               background=not args.no_background,
                               terminate_on_completion=not args.no_terminate)
         print("[{}][stdout]: {}".format(instance_ip, cli_out['stdout']))
         print("[{}][stderr]: {}".format(instance_ip, cli_out['stderr']))
 
+    Parallel(n_jobs=len(instance_ips))(
+        delayed(run_command_on_remote)(ip) for ip in instance_ips)
+
 if __name__ == "__main__":
     # print the config and sanity check
     pprint.PrettyPrinter(indent=4).pprint(vars(args))
     assert args.cmd is not None, "need to specify a command"
-
-    # parallelize the job create due to required sleep commands
-    Parallel(n_jobs=args.number_of_instances)(
-        delayed(main)(args) for i in range(args.number_of_instances))
+    main(args)
