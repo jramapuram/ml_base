@@ -19,7 +19,7 @@ from helpers.metrics import softmax_accuracy, bce_accuracy, \
 from helpers.grapher import Grapher
 from helpers.layers import EarlyStopping, append_save_and_load_fns
 from helpers.utils import dummy_context, ones_like, get_name, \
-    append_to_csv, check_or_create_dir
+    append_to_csv, check_or_create_dir, get_aws_instance_id
 from helpers.fid import train_fid_model
 
 
