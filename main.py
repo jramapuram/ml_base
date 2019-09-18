@@ -15,9 +15,9 @@ from torchvision.models.resnet import resnet18
 
 from helpers.grapher import Grapher
 from datasets.loader import get_loader
-from helpers.layers import EarlyStopping, append_save_and_load_fns
+from helpers.layers import ModelSaver, append_save_and_load_fns
 from helpers.utils import dummy_context, get_name, \
-    append_to_csv, check_or_create_dir
+    append_to_csv, check_or_create_dir, get_aws_instance_id
 from helpers.metrics import softmax_accuracy, bce_accuracy, \
     softmax_correct, all_or_none_accuracy, calculate_fid, calculate_mssim
 
@@ -29,7 +29,7 @@ parser.add_argument('--task', type=str, default="fashion",
                     help="""task to work on (can specify multiple) [mnist / cifar10 /
                     fashion / svhn_centered / svhn / clutter / permuted] (default: mnist)""")
 parser.add_argument('--batch-size', type=int, default=128, metavar='N',
-                    help='input batch size for training (default: 128)')
+                    help='help batch size for training (default: 128)')
 parser.add_argument('--epochs', type=int, default=3000, metavar='N',
                     help='minimum number of epochs to train (default: 10000)')
 parser.add_argument('--download', type=int, default=1,
@@ -38,6 +38,8 @@ parser.add_argument('--image-size-override', type=int, default=224,
                     help='Override and force resizing of images to this specific size (default: 224)')
 parser.add_argument('--data-dir', type=str, default='./.datasets', metavar='DD',
                     help='directory which contains input data')
+parser.add_argument('--model-dir', type=str, default='.models',
+                    help='directory which contains saved models (default: .models)')
 parser.add_argument('--uid', type=str, default="",
                     help='uid for current session (default: empty-str)')
 
@@ -125,7 +127,7 @@ def build_loader_model_grapher(args):
     network = resnet18(num_classes=loader.output_size)
     lazy_generate_modules(network, loader.train_loader)
     network = network.cuda() if args.cuda else network
-    network = append_save_and_load_fns(network, prefix="VAE_")
+
     if args.ngpu > 1:
         print("data-paralleling...")
         network.parallel()
@@ -265,7 +267,7 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     start_time = time.time()
     model.eval() if prefix == 'test' else model.train()
     assert optimizer is not None if 'train' in prefix or 'valid' in prefix else optimizer is None
-    loss_map, num_samples, print_once = {}, 0, False
+    loss_map, num_samples = {}, 0
 
     # iterate over train and valid data
     for minibatch, labels in loader:
@@ -301,7 +303,7 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
         loss_map['accuracy_mean'].item() * 100.0))
 
     # plot the test accuracy, loss and images
-    register_plots({**loss_map}, grapher, epoch=epoch, prefix='linear'+prefix)
+    register_plots({**loss_map}, grapher, epoch=epoch, prefix=prefix)
     register_images({'input_imgs': F.upsample(minibatch, size=(100, 100))}, grapher, prefix=prefix)
 
     # return this for early stopping
@@ -350,15 +352,23 @@ def run(args):
     """
     loader, model, grapher = build_loader_model_grapher(args)   # build the model, loader and grapher
     optimizer = build_optimizer(model)                          # the optimizer for the vae
-    early = EarlyStopping(model, max_steps=200,                 # the early-stopping object
-                          burn_in_interval=int(args.epochs*0.2)) if args.early_stop else None
+    if args.half:
+        model, optimizer = amp.initialize(model, optimizer, opt_level="O1")
+
+    # build the early-stopping (or best-saver) objects and restore if we had a previous model
+    model = append_save_and_load_fns(model, optimizer, grapher, args)
+    saver = ModelSaver(args, model, burn_in_interval=int(0.1 * args.epochs),
+                       larger_is_better=False, max_early_stop_steps=10)
+    restore_dict = saver.restore()
+    init_epoch = restore_dict['epoch']
 
     # main training loop
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(init_epoch, args.epochs + 1):
         train(epoch, model, optimizer, loader.train_loader, grapher)
         test_loss = test(epoch, model, loader.test_loader, grapher)
-        if args.early_stop and early(test_loss):
-            early.restore() # restore and test+generate again
+
+        if saver(test_loss): # do one more test if we are early stopping
+            saver.restore()
             test_loss = test(epoch, model, loader.test_loader, grapher)
             break
 

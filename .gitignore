@@ -103,6 +103,7 @@ ENV/
 # osx
 .DS_Store
 
-# datasets
+# datasets and saved models dont goto git
 .datasets/
+.models/
 runs

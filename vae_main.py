@@ -17,7 +17,7 @@ from datasets.loader import get_loader
 from helpers.metrics import softmax_accuracy, bce_accuracy, \
     softmax_correct, all_or_none_accuracy, calculate_fid, calculate_mssim
 from helpers.grapher import Grapher
-from helpers.layers import EarlyStopping, append_save_and_load_fns
+from helpers.layers import ModelSaver, append_save_and_load_fns
 from helpers.utils import dummy_context, ones_like, get_name, \
     append_to_csv, check_or_create_dir, get_aws_instance_id
 from helpers.fid import train_fid_model
@@ -198,10 +198,7 @@ def build_loader_model_grapher(args):
     network = build_vae(args.vae_type)(loader.img_shp, kwargs=deepcopy(vars(args)))
     lazy_generate_modules(network, loader.train_loader)
     network = network.cuda() if args.cuda else network
-    # if args.half: # done below with amp
-    #     network.fp16()
 
-    network = append_save_and_load_fns(network, prefix="VAE_")
     if args.ngpu > 1:
         print("data-paralleling...")
         network.parallel()
@@ -478,17 +475,24 @@ def run(args):
     if args.half:
         model, optimizer = amp.initialize(model, optimizer, opt_level="O1")
 
-    early = EarlyStopping(model, max_steps=200,                 # the early-stopping object
-                          burn_in_interval=int(args.epochs*0.2)) if args.early_stop else None
+    # build the early-stopping (or best-saver) objects and restore if we had a previous model
+    model = append_save_and_load_fns(model, optimizer, grapher, args)
+    saver = ModelSaver(args, model, burn_in_interval=int(0.1 * args.epochs),
+                       larger_is_better=False, max_early_stop_steps=10)
+    restore_dict = saver.restore()
+    init_epoch = restore_dict['epoch']
+
+    # add the the fid model if requested
     fid_model = train_fid_model(args, fid_type=args.calculate_fid_with, batch_size=32) \
         if args.calculate_fid_with is not None else None        # the FID object
 
     # main training loop
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(init_epoch, args.epochs + 1):
         train(epoch, model, optimizer, loader.train_loader, grapher)
         test_loss = test(epoch, model, loader.test_loader, grapher)
-        if args.early_stop and early(test_loss):
-            early.restore() # restore and test+generate again
+
+        if saver(test_loss): # do one more test if we are early stopping
+            saver.restore()
             test_loss = test(epoch, model, loader.test_loader, grapher)
             break
 
