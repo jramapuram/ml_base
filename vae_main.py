@@ -198,6 +198,7 @@ def build_loader_model_grapher(args):
     network = build_vae(args.vae_type)(loader.img_shp, kwargs=deepcopy(vars(args)))
     lazy_generate_modules(network, loader.train_loader)
     network = network.cuda() if args.cuda else network
+    print(network)
 
     if args.ngpu > 1:
         print("data-paralleling...")
