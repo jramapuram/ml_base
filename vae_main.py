@@ -15,13 +15,12 @@ from torchvision import transforms
 from models.vae import build_vae
 from datasets.loader import get_loader
 from helpers.metrics import softmax_accuracy, bce_accuracy, \
-    softmax_correct, all_or_none_accuracy, calculate_fid, calculate_mssim
+    softmax_correct, all_or_none_accuracy, calculate_mssim
 from helpers.grapher import Grapher
 from helpers.layers import ModelSaver, append_save_and_load_fns
 from helpers.utils import dummy_context, ones_like, get_name, \
     append_to_csv, check_or_create_dir, get_aws_instance_id
-from helpers.fid import train_fid_model
-
+from helpers.async_fid.client import FIDClient
 
 parser = argparse.ArgumentParser(description='')
 
@@ -31,8 +30,8 @@ parser.add_argument('--task', type=str, default="fashion",
                     fashion / svhn_centered / svhn / clutter / permuted] (default: mnist)""")
 parser.add_argument('--batch-size', type=int, default=128, metavar='N',
                     help='input batch size for training (default: 128)')
-parser.add_argument('--epochs', type=int, default=3000, metavar='N',
-                    help='minimum number of epochs to train (default: 10000)')
+parser.add_argument('--epochs', type=int, default=1000, metavar='N',
+                    help='minimum number of epochs to train (default: 1000)')
 parser.add_argument('--download', type=int, default=1,
                     help='download dataset from s3 (default: 1)')
 parser.add_argument('--image-size-override', type=int, default=None,
@@ -103,9 +102,9 @@ parser.add_argument('--add-img-noise', action='store_true', default=False,
 
 # Metrics
 parser.add_argument('--calculate-msssim', action='store_true', default=False,
-                    help='enables FID calc & uses model conv/inceptionv3  (default: None)')
-parser.add_argument('--calculate-fid-with', type=str, default=None,
-                    help='calculated the multi-scale structural similarity (default: False)')
+                    help='enables MS-SSIM (default: False)')
+parser.add_argument('--fid-server', type=str, default=None,
+                    help='fid server url with port;  eg: myhost:8000 (default: None)')
 
 # Optimization related
 parser.add_argument('--lr', type=float, default=1e-3, metavar='LR',
@@ -364,9 +363,7 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
 
         if 'train' in prefix: # compute bp and optimize
             if args.half:
-                #optimizer.backward(loss_t['loss_mean'])
-                with amp_handle.scale_loss(loss_t['loss_mean'], optimizer,
-                                           dynamic_loss_scale=True) as scaled_loss:
+                with amp.scale_loss(loss_t['loss_mean'], optimizer) as scaled_loss:
                     scaled_loss.backward()
             else:
                 loss_t['loss_mean'].backward()
@@ -413,6 +410,7 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
                                                      use_aggregate_posterior=args.use_aggregate_posterior)
     elif args.decoder_layer_type != 'pixelcnn':
         generated = model.generate_synthetic_samples(args.batch_size, reset_state=True,
+                                                     #override_noisy_state=True,
                                                      use_aggregate_posterior=args.use_aggregate_posterior)
 
     # tack on images to grapher
@@ -474,7 +472,7 @@ def run(args):
     loader, model, grapher = build_loader_model_grapher(args)   # build the model, loader and grapher
     optimizer = build_optimizer(model)                          # the optimizer for the vae
     if args.half:
-        model, optimizer = amp.initialize(model, optimizer, opt_level="O1")
+        model, optimizer = amp.initialize(model, optimizer, opt_level="O2")
 
     # build the early-stopping (or best-saver) objects and restore if we had a previous model
     model = append_save_and_load_fns(model, optimizer, grapher, args)
@@ -484,8 +482,9 @@ def run(args):
     init_epoch = restore_dict['epoch']
 
     # add the the fid model if requested
-    fid_model = train_fid_model(args, fid_type=args.calculate_fid_with, batch_size=32) \
-        if args.calculate_fid_with is not None else None        # the FID object
+    if args.fid_server is not None:
+        model.fid_client = FIDClient(host=args.fid_server.split(':')[0],
+                                     port=args.fid_server.split(':')[1])
 
     # main training loop
     for epoch in range(init_epoch, args.epochs + 1):
@@ -499,13 +498,6 @@ def run(args):
 
         if epoch == 2: # make sure we do at least 1 test and train pass
             grapher.add_text('config', pprint.PrettyPrinter(indent=4).pformat(vars(args)),0)#, append=True)
-
-    # compute fid if requested
-    if fid_model is not None:
-        fid_score = calculate_fid(fid_model, model, loader,
-                                  grapher, num_samples=1000,
-                                  cuda=args.cuda)
-        print("FID = ", fid_score)
 
     # cleanups
     grapher.close()

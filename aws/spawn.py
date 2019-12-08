@@ -190,6 +190,7 @@ def create_spot(args):
         print("setting max price to {}".format(max_price))
 
         zone_override = cheapest_zone if args.instance_zone is None else args.instance_zone
+        zone_override = None if args.instance_zone == 'none' else zone_override
         #zone_override = None if args.instance_zone is None else args.instance_zone
         launch_spec_dict = get_launch_spec(args, zone_override)
 
