@@ -1,26 +1,28 @@
 import os
 import time
 import argparse
+import functools
 import pprint
 import torch
 import torchvision
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
 import numpy as np
 
 from copy import deepcopy
 from torchvision import transforms
 
+import helpers.metrics as metrics
+import helpers.layers as layers
+import helpers.utils as utils
+import optimizers.scheduler as scheduler
+
 from models.vae import build_vae
 from datasets.loader import get_loader
-from helpers.metrics import softmax_accuracy, bce_accuracy, \
-    softmax_correct, all_or_none_accuracy, calculate_mssim
 from helpers.grapher import Grapher
-from helpers.layers import ModelSaver, append_save_and_load_fns
-from helpers.utils import dummy_context, ones_like, get_name, \
-    append_to_csv, check_or_create_dir, get_aws_instance_id
 from helpers.async_fid.client import FIDClient
+from optimizers.lars import LARS
+
 
 parser = argparse.ArgumentParser(description='')
 
@@ -30,7 +32,7 @@ parser.add_argument('--task', type=str, default="fashion",
                     fashion / svhn_centered / svhn / clutter / permuted] (default: mnist)""")
 parser.add_argument('--batch-size', type=int, default=128, metavar='N',
                     help='input batch size for training (default: 128)')
-parser.add_argument('--epochs', type=int, default=1000, metavar='N',
+parser.add_argument('--epochs', type=int, default=3000, metavar='N',
                     help='minimum number of epochs to train (default: 1000)')
 parser.add_argument('--download', type=int, default=1,
                     help='download dataset from s3 (default: 1)')
@@ -44,6 +46,8 @@ parser.add_argument('--uid', type=str, default="",
 # VAE related
 parser.add_argument('--vae-type', type=str, default='simple',
                     help='parallel, sequential, vrnn, simple, msg (default: simple)')
+parser.add_argument('--monte-carlo-posterior-samples', type=int, default=1,
+                    help='number of monte carlo samples to use from posterior (default: 1)')
 parser.add_argument('--nll-type', type=str, default='bernoulli',
                     help='bernoulli or gaussian (default: bernoulli)')
 parser.add_argument('--reparam-type', type=str, default='isotropic_gaussian',
@@ -68,10 +72,18 @@ parser.add_argument('--decoder-layer-type', type=str, default='conv',
                     help='dense / conv / coordconv (default: conv)')
 parser.add_argument('--activation', type=str, default='elu',
                     help='default activation function (default: elu)')
+parser.add_argument('--weight-initialization', type=str, default=None,
+                    help='weight initialization type; None uses default pytorch init. (default: None)')
 parser.add_argument('--latent-size', type=int, default=512, metavar='N',
                     help='sizing for latent layers (default: 512)')
-parser.add_argument('--filter-depth', type=int, default=32,
+parser.add_argument('--encoder-base-channels', type=int, default=32,
                     help='number of initial conv filter maps (default: 32)')
+parser.add_argument('--encoder-channel-multiplier', type=int, default=2,
+                    help='grow channels by this per layer (default: 2)')
+parser.add_argument('--decoder-base-channels', type=int, default=1024,
+                    help='number of initial conv filter maps (default: 1024)')
+parser.add_argument('--decoder-channel-multiplier', type=float, default=0.5,
+                    help='shrinks channels by this per layer (default: 0.5)')
 parser.add_argument('--disable-gated', action='store_true', default=False,
                     help='disables gated convolutional or dense structure (default: False)')
 parser.add_argument('--model-dir', type=str, default='.models',
@@ -93,6 +105,8 @@ parser.add_argument('--mut-clamp-value', type=float, default=100.0,
 
 # Regularizer
 parser.add_argument('--kl-beta', type=float, default=1, help='beta-vae kl term (default: 1)')
+parser.add_argument('--weight-decay', type=float, default=0, help='weight decay (default: 0)')
+parser.add_argument('--polyak-ema', type=float, default=0, help='Polyak weight averaging co-ef (default: 0)')
 parser.add_argument('--conv-normalization', type=str, default='groupnorm',
                     help='normalization type: batchnorm/groupnorm/instancenorm/none (default: groupnorm)')
 parser.add_argument('--dense-normalization', type=str, default='batchnorm',
@@ -107,8 +121,12 @@ parser.add_argument('--fid-server', type=str, default=None,
                     help='fid server url with port;  eg: myhost:8000 (default: None)')
 
 # Optimization related
-parser.add_argument('--lr', type=float, default=1e-3, metavar='LR',
+parser.add_argument('--lr', type=float, default=4e-4, metavar='LR',
                     help='learning rate (default: 1e-3)')
+parser.add_argument('--lr-update-schedule', type=str, default='fixed',
+                    help='learning rate schedule fixed/step/cosine (default: fixed)')
+parser.add_argument('--warmup', type=int, default=3,
+                    help='warmup epochs (default: 0)')
 parser.add_argument('--optimizer', type=str, default="adam",
                     help="specify optimizer (default: adam)")
 parser.add_argument('--early-stop', action='store_true',
@@ -121,12 +139,12 @@ parser.add_argument('--visdom-port', type=int, default=None,
                     help='visdom port for graphs (default: None)')
 
 # Device /debug stuff
+parser.add_argument('--num-replicas', type=int, default=1,
+                    help='number of compute devices available; 1 means just local (default: 1)')
 parser.add_argument('--debug-step', action='store_true', default=False,
                     help='only does one step of the execute_graph function per call instead of all minibatches')
 parser.add_argument('--seed', type=int, default=None,
                     help='seed for numpy and pytorch (default: None)')
-parser.add_argument('--ngpu', type=int, default=1,
-                    help='number of gpus available (default: 1)')
 parser.add_argument('--no-cuda', action='store_true', default=False,
                     help='disables CUDA training')
 parser.add_argument('--half', action='store_true', default=False,
@@ -138,7 +156,7 @@ if args.cuda:
     torch.backends.cudnn.benchmark = True
 
 # add aws job ID to config if it exists
-aws_instance_id = get_aws_instance_id()
+aws_instance_id = utils.get_aws_instance_id()
 if aws_instance_id is not None:
     args.instance_id = aws_instance_id
 
@@ -157,7 +175,31 @@ if args.seed is not None:
         torch.cuda.manual_seed_all(args.seed)
 
 
-def build_optimizer(model):
+def build_lr_schedule(optimizer, last_epoch=-1):
+    """ adds a lr scheduler to the optimizer.
+
+    :param optimizer: nn.Optimizer
+    :returns: scheduler
+    :rtype: optim.lr_scheduler
+
+    """
+    if args.lr_update_schedule == 'fixed':
+        sched = optim.lr_scheduler.LambdaLR(optimizer, lambda epoch: 1.0, last_epoch=last_epoch)
+    elif args.lr_update_schedule == 'cosine':
+        total_epochs = args.epochs - args.warmup
+        sched = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs, last_epoch=last_epoch)
+    else:
+        raise NotImplementedError("lr scheduler {} not implemented".format(args.lr_update_schedule))
+
+    # If warmup was requested add it.
+    if args.warmup > 0:
+        warmup = scheduler.LinearWarmup(optimizer, warmup_steps=args.warmup, last_epoch=last_epoch)
+        sched = scheduler.Scheduler(sched, warmup)
+
+    return sched
+
+
+def build_optimizer(model, last_epoch=-1):
     """ helper to build the optimizer and wrap model
 
     :param model: the model to wrap
@@ -170,11 +212,28 @@ def build_optimizer(model):
         "adam": optim.Adam,
         "adadelta": optim.Adadelta,
         "sgd": optim.SGD,
-        "lbfgs": optim.LBFGS
+        "momentum": functools.partial(optim.SGD, momentum=0.9),
+        "lbfgs": optim.LBFGS,
     }
-    return optim_map[args.optimizer.lower().strip()](
-        model.parameters(), lr=args.lr
-    )
+
+    # Add weight decay (if > 0) and extract the optimizer string
+    params_to_optimize = layers.add_weight_decay(model, args.weight_decay)
+    full_opt_name = args.optimizer.lower().strip()
+    is_lars = 'lars' in full_opt_name
+    opt_name = full_opt_name.split('_')[-1] if is_lars else full_opt_name
+    print("using {} optimizer {} lars.".format(opt_name, 'with'if is_lars else 'without'))
+
+    # Build the base optimizer
+    lr = args.lr * (args.batch_size / 256) if opt_name not in ["adam", "rmsprop"] else args.lr  # Following SimCLR
+    opt = optim_map[opt_name](params_to_optimize, lr=lr)
+
+    # Wrap it with LARS if requested
+    if is_lars:
+        opt = LARS(opt)
+
+    # Build the schedule and return
+    sched = build_lr_schedule(opt, last_epoch=last_epoch)
+    return opt, sched
 
 
 def build_loader_model_grapher(args):
@@ -187,29 +246,49 @@ def build_loader_model_grapher(args):
 
     """
     resize_shape = (args.image_size_override, args.image_size_override)
-    transform = [torchvision.transforms.Resize(resize_shape)] \
-        if args.image_size_override else None
-    loader = get_loader(args, transform=transform, **vars(args))  # build the loader
-    args.input_shape = loader.img_shp if args.image_size_override is None \
-        else [loader.img_shp[0], *resize_shape]                   # set the input size
+    resize_xform = transforms.Resize(resize_shape) if args.image_size_override \
+        else transforms.Lambda(lambda x: x)
+    train_transform = [transforms.CenterCrop(160),
+                       resize_xform,
+                       transforms.RandomApply([transforms.ColorJitter(0.8, 0.8, 0.2)], p=0.8),
+                       transforms.RandomGrayscale(p=0.1),
+                       transforms.RandomHorizontalFlip(p=0.5),
+                       transforms.ToTensor(),
+                       # transforms.RandomApply([transforms.Lambda(lambda x: x + torch.randn(x.shape)*0.02)], p=0.5)]
+                       ]
+    test_transform = [transforms.CenterCrop(160),
+                      resize_xform]
+    loader_dict = {'train_transform': train_transform,
+                   'test_transform': test_transform,
+                   **vars(args)}
+    loader = get_loader(**loader_dict)
+
+    # set the input size
+    args.input_shape = loader.input_shape
 
     # build the network
-    network = build_vae(args.vae_type)(loader.img_shp, kwargs=deepcopy(vars(args)))
+    network = build_vae(args.vae_type)(loader.input_shape, kwargs=deepcopy(vars(args)))
     lazy_generate_modules(network, loader.train_loader)
-    network = network.cuda() if args.cuda else network
-    print(network)
+    network = network.cuda(args.gpu) if args.cuda else network
+    network = layers.init_weights(network, init=args.weight_initialization)
 
-    if args.ngpu > 1:
+    # Get some info about the structure and number of params.
+    print(network)
+    print("model has {} million parameters.".format(
+        utils.number_of_parameters(network) / 1e6
+    ))
+
+    if args.num_replicas > 1:
         print("data-paralleling...")
-        network.parallel()
+        network.parallel([args.gpu])
 
     # build the grapher object
     if args.visdom_url:
-        grapher = Grapher('visdom', env=get_name(args),
+        grapher = Grapher('visdom', env=utils.get_name(args),
                           server=args.visdom_url,
                           port=args.visdom_port)
     else:
-        grapher = Grapher('tensorboard', comment=get_name(args))
+        grapher = Grapher('tensorboard', comment=utils.get_name(args))
 
     return loader, network, grapher
 
@@ -224,11 +303,15 @@ def lazy_generate_modules(model, loader):
 
     """
     model.eval()
-    model.config['half'] = False # disable half here due to CPU weights
+    model.config['half'] = False  # disable half here due to CPU weights
     for minibatch, labels in loader:
         with torch.no_grad():
             _ = model(minibatch)
             break
+
+    # initialize the polyak-ema op if it exists
+    if hasattr(model, 'polyak_ema') and args.polyak_ema > 0:
+        layers.polyak_ema_parameters(model, args.polyak_ema)
 
     # reset half tensors if requested since torch.cuda.HalfTensor has impls
     model.config['half'] = args.half
@@ -267,14 +350,14 @@ def register_images(output_map, grapher, prefix='train'):
     """
     for k, v in output_map.items():
         if isinstance(v, dict):
-            register_images(output_map[k], grapher, epoch, prefix=prefix)
+            register_images(output_map[k], grapher, prefix=prefix)
 
         if 'img' in k or 'imgs' in k:
             key_name = '-'.join(k.split('_')[0:-1])
             img = torchvision.utils.make_grid(v, normalize=True, scale_each=True)
             grapher.add_image('{}_{}'.format(prefix, key_name),
                               img.detach(),
-                              global_step=0) # dont use step
+                              global_step=0)  # dont use step
 
 
 def _add_loss_map(loss_tm1, loss_t):
@@ -286,7 +369,7 @@ def _add_loss_map(loss_tm1, loss_t):
     :rtype: dict
 
     """
-    if not loss_tm1: # base case: empty dict
+    if not loss_tm1:  # base case: empty dict
         resultant = {'count': 1}
         for k, v in loss_t.items():
             if 'mean' in k or 'scalar' in k:
@@ -341,32 +424,37 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
 
     """
     start_time = time.time()
-    model.eval() if prefix == 'test' else model.train()
-    assert optimizer is not None if 'train' in prefix or 'valid' in prefix else optimizer is None
-    loss_map, num_samples, print_once = {}, 0, False
+    is_eval = prefix != 'train'
+    model.eval() if is_eval else model.train()
+    assert optimizer is None if is_eval else optimizer is not None
+    loss_map, num_samples = {}, 0
 
     # iterate over data and labels
     for minibatch, labels in loader:
-        minibatch = minibatch.cuda() if args.cuda else minibatch
-        labels = labels.cuda() if args.cuda else labels
-        if args.half:
-            minibatch = minibatch.half()
+        minibatch = minibatch.cuda(args.gpu, non_blocking=True) if args.cuda else minibatch
+        labels = labels.cuda(args.gpu, non_blocking=True) if args.cuda else labels
+        # if args.half:
+        #     minibatch = minibatch.half()
 
-        if 'train' in prefix:
-            optimizer.zero_grad()                                                # zero gradients on optimizer
+        with torch.no_grad() if prefix == 'test' else utils.dummy_context():
+            if is_eval and args.polyak_ema > 0:                                # use the Polyak model for predictions
+                pred_logits, reparam_map = layers.get_polyak_prediction(
+                    model, pred_fn=functools.partial(model, minibatch))
+            else:
+                pred_logits, reparam_map = model(minibatch)                    # get normal predictions
 
-        with torch.no_grad() if prefix == 'test' else dummy_context():
-            pred_logits, reparam_map = model(minibatch)                          # get normal predictions
-            loss_t = model.loss_function(pred_logits, minibatch, reparam_map)
-            loss_map = _add_loss_map(loss_map, loss_t)
-            num_samples += minibatch.size(0)
+            loss_t = model.loss_function(pred_logits, minibatch, reparam_map,  # compute loss
+                                         K=args.monte_carlo_posterior_samples)
+            loss_map = _add_loss_map(loss_map, loss_t)                         # aggregate loss
+            num_samples += minibatch.size(0)                                   # count minibatch samples
 
-        if 'train' in prefix: # compute bp and optimize
+        if not is_eval:                                                        # compute bp and optimize
+            optimizer.zero_grad()                                              # zero gradients on optimizer
             if args.half:
                 with amp.scale_loss(loss_t['loss_mean'], optimizer) as scaled_loss:
-                    scaled_loss.backward()
+                    scaled_loss.backward()                                     # compute grads (fp16+fp32)
             else:
-                loss_t['loss_mean'].backward()
+                loss_t['loss_mean'].backward()                                 # compute grads (fp32)
 
             if args.clip > 0:
                 # TODO: clip by value or norm? torch.nn.utils.clip_grad_value_
@@ -375,14 +463,20 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
                     if not args.half else optimizer.clip_master_grads(args.clip)
 
             optimizer.step()
+            if args.polyak_ema > 0:                                            # update Polyak mean if requested
+                layers.polyak_ema_parameters(model, args.polyak_ema)
+
             del loss_t
 
-        if args.debug_step: # for testing purposes
+        if args.debug_step:  # for testing purposes
             break
 
     # compute the mean of the map
-    loss_map = _mean_map(loss_map) # reduce the map to get actual means
-    print('{}[Epoch {}][{} samples][{:.2f} sec]:\t Loss: {:.4f}\t-ELBO: {:.4f}\tNLL: {:.4f}\tKLD: {:.4f}\tMI: {:.4f}'.format(
+    loss_map = _mean_map(loss_map)                                             # reduce the map to get actual means
+
+    # log some stuff
+    to_log = '{}[Epoch {}][{} samples][{:.2f} sec]:\t Loss: {:.4f}\t-ELBO: {:.4f}\tNLL: {:.4f}\tKLD: {:.4f}\tMI: {:.4f}'
+    print(to_log.format(
         prefix, epoch, num_samples, time.time() - start_time,
         loss_map['loss_mean'].item(),
         loss_map['elbo_mean'].item(),
@@ -395,7 +489,8 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
 
     # tack on MSSIM information if requested
     if args.calculate_msssim:
-        loss_map['ms_ssim_mean'] = compute_mssim(reconstr_image, minibatch)
+        loss_map['ms_ssim_mean'] = metrics.compute_mssim(
+            reconstr_map['reconstruction_imgs'], minibatch)
 
     # gather scalar values of reparameterizers (if they exist)
     reparam_scalars = model.get_reparameterizer_scalars()
@@ -405,29 +500,30 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
 
     # get some generations, only do once in a while for pixelcnn
     generated = None
-    if args.decoder_layer_type == 'pixelcnn' and epoch % 10 == 0:
+    if args.vae_type == 'pixelvae' and epoch % 10 == 0:
         generated = model.generate_synthetic_samples(args.batch_size, reset_state=True,
                                                      use_aggregate_posterior=args.use_aggregate_posterior)
-    elif args.decoder_layer_type != 'pixelcnn':
+    else:
         generated = model.generate_synthetic_samples(args.batch_size, reset_state=True,
-                                                     #override_noisy_state=True,
+                                                     # override_noisy_state=True,
                                                      use_aggregate_posterior=args.use_aggregate_posterior)
 
     # tack on images to grapher
-    image_map = {
-        'input_imgs': F.upsample(minibatch, (100, 100)) if args.task == 'image_folder' else minibatch
-    }
+    image_map = {'input_imgs': minibatch}
     if generated is not None:
-        image_map['generated_imgs'] = F.upsample(generated, (100, 100)) \
-            if args.task == 'image_folder' else generated
+        image_map['generated_imgs'] = generated
 
     register_images({**image_map, **reconstr_map}, grapher, prefix=prefix)
     grapher.save()
 
     # cleanups (see https://tinyurl.com/ycjre67m) + return ELBO for early stopping
     loss_val = loss_map['elbo_mean'].detach().item()
-    loss_map.clear(); image_map.clear(); reparam_map.clear(); reparam_scalars.clear()
-    del minibatch; del labels
+    for d in [loss_map, image_map, reparam_map, reparam_scalars]:
+        d.clear()
+
+    del minibatch
+    del labels
+
     return loss_val
 
 
@@ -461,7 +557,28 @@ def test(epoch, model, test_loader, grapher, prefix='test'):
     return execute_graph(epoch, model, test_loader, grapher, prefix='test')
 
 
-def run(args):
+def handle_multiprocessing_logic(rank, num_replicas, args):
+    """Sets the appropriate flags for multi-process jobs."""
+    args.gpu = rank  # Set the GPU device to use
+
+    if num_replicas > 1:
+        os.environ['MASTER_ADDR'] = '127.0.0.1'
+        os.environ['MASTER_PORT'] = '29300'
+        torch.distributed.init_process_group(
+            backend='nccl', init_method='env://',
+            world_size=args.num_replicas, rank=rank
+            # rank=int(os.environ["RANK"])
+        )
+
+        # Set the cuda device
+        torch.cuda.set_device(rank)
+        print("Replica {} / {} using GPU: {}".format(
+            rank + 1, num_replicas, torch.cuda.get_device_name(rank)))
+
+    return args
+
+
+def run(rank, num_replicas, args):
     """ Main entry-point into the program
 
     :param args: argparse
@@ -469,15 +586,16 @@ def run(args):
     :rtype: None
 
     """
-    loader, model, grapher = build_loader_model_grapher(args)   # build the model, loader and grapher
-    optimizer = build_optimizer(model)                          # the optimizer for the vae
+    args = handle_multiprocessing_logic(rank, num_replicas, args)  # handle multi-process init logic
+    loader, model, grapher = build_loader_model_grapher(args)      # build the model, loader and grapher
+    optimizer, scheduler = build_optimizer(model)                  # the optimizer for the vae
     if args.half:
         model, optimizer = amp.initialize(model, optimizer, opt_level="O2")
 
     # build the early-stopping (or best-saver) objects and restore if we had a previous model
-    model = append_save_and_load_fns(model, optimizer, grapher, args)
-    saver = ModelSaver(args, model, burn_in_interval=int(0.1 * args.epochs),
-                       larger_is_better=False, max_early_stop_steps=10)
+    model = layers.append_save_and_load_fns(model, optimizer, scheduler, grapher, args)
+    saver = layers.ModelSaver(args, model, burn_in_interval=int(0.1 * args.epochs),
+                              larger_is_better=False, max_early_stop_steps=10)
     restore_dict = saver.restore()
     init_epoch = restore_dict['epoch']
 
@@ -491,13 +609,23 @@ def run(args):
         train(epoch, model, optimizer, loader.train_loader, grapher)
         test_loss = test(epoch, model, loader.test_loader, grapher)
 
-        if saver(test_loss): # do one more test if we are early stopping
+        # update the learning rate and plot it
+        scheduler.step()
+        # register_plots({'learning_rate_scalar': scheduler.get_last_lr()[0]}, grapher, epoch)
+        register_plots({'learning_rate_scalar': optimizer.param_groups[0]['lr']}, grapher, epoch)
+
+        if saver(test_loss):  # do one more test if we are early stopping
             saver.restore()
             test_loss = test(epoch, model, loader.test_loader, grapher)
             break
 
-        if epoch == 2: # make sure we do at least 1 test and train pass
-            grapher.add_text('config', pprint.PrettyPrinter(indent=4).pformat(vars(args)),0)#, append=True)
+        if epoch == 2:  # make sure we do at least 1 test and train pass
+            config_to_post = vars(args)
+            slurm_id = utils.get_slurm_id()
+            if slurm_id is not None:
+                config_to_post['slurm_job_id'] = slurm_id
+
+            grapher.add_text('config', pprint.PrettyPrinter(indent=4).pformat(config_to_post), 0)
 
     # cleanups
     grapher.close()
@@ -505,4 +633,4 @@ def run(args):
 
 if __name__ == "__main__":
     print(pprint.PrettyPrinter(indent=4).pformat(vars(args)))
-    run(args)
+    run(rank=1, num_replicas=args.num_replicas, args=args)  # Non-distributed launch
