@@ -7,6 +7,7 @@ import torch
 import torchvision
 import torch.nn as nn
 import torch.optim as optim
+import torch.multiprocessing as mp
 import numpy as np
 
 from copy import deepcopy
@@ -141,6 +142,8 @@ parser.add_argument('--visdom-port', type=int, default=None,
 # Device /debug stuff
 parser.add_argument('--num-replicas', type=int, default=1,
                     help='number of compute devices available; 1 means just local (default: 1)')
+parser.add_argument('--workers-per-replica', type=int, default=2,
+                    help='threads per replica for the data loader (default: 2)')
 parser.add_argument('--debug-step', action='store_true', default=False,
                     help='only does one step of the execute_graph function per call instead of all minibatches')
 parser.add_argument('--seed', type=int, default=None,
@@ -263,14 +266,18 @@ def build_loader_model_grapher(args):
                    **vars(args)}
     loader = get_loader(**loader_dict)
 
-    # set the input size
+    # set the input tensor shape (ignoring batch dimension)
     args.input_shape = loader.input_shape
 
     # build the network
     network = build_vae(args.vae_type)(loader.input_shape, kwargs=deepcopy(vars(args)))
-    lazy_generate_modules(network, loader.train_loader)
     network = network.cuda(args.gpu) if args.cuda else network
+    lazy_generate_modules(network, loader.train_loader)
     network = layers.init_weights(network, init=args.weight_initialization)
+
+    if args.num_replicas > 1:
+        print("data-paralleling...")
+        network.parallel([args.gpu])
 
     # Get some info about the structure and number of params.
     print(network)
@@ -278,16 +285,13 @@ def build_loader_model_grapher(args):
         utils.number_of_parameters(network) / 1e6
     ))
 
-    if args.num_replicas > 1:
-        print("data-paralleling...")
-        network.parallel([args.gpu])
-
     # build the grapher object
-    if args.visdom_url:
+    grapher = None
+    if args.visdom_url and args.gpu == 0:
         grapher = Grapher('visdom', env=utils.get_name(args),
                           server=args.visdom_url,
                           port=args.visdom_port)
-    else:
+    elif args.gpu == 0:
         grapher = Grapher('tensorboard', comment=utils.get_name(args))
 
     return loader, network, grapher
@@ -306,6 +310,7 @@ def lazy_generate_modules(model, loader):
     model.config['half'] = False  # disable half here due to CPU weights
     for minibatch, labels in loader:
         with torch.no_grad():
+            minibatch = minibatch.cuda(args.gpu, non_blocking=True) if args.cuda else minibatch
             _ = model(minibatch)
             break
 
@@ -328,14 +333,15 @@ def register_plots(loss, grapher, epoch, prefix='train'):
     :rtype: None
 
     """
-    for k, v in loss.items():
-        if isinstance(v, dict):
-            register_plots(loss[k], grapher, epoch, prefix=prefix)
+    if args.gpu == 0 and grapher is not None:  # Only send stuff to visdom once.
+        for k, v in loss.items():
+            if isinstance(v, dict):
+                register_plots(loss[k], grapher, epoch, prefix=prefix)
 
-        if 'mean' in k or 'scalar' in k:
-            key_name = '-'.join(k.split('_')[0:-1])
-            value = v.item() if not isinstance(v, (float, np.float32, np.float64)) else v
-            grapher.add_scalar('{}_{}'.format(prefix, key_name), value, epoch)
+            if 'mean' in k or 'scalar' in k:
+                key_name = '-'.join(k.split('_')[0:-1])
+                value = v.item() if not isinstance(v, (float, np.float32, np.float64)) else v
+                grapher.add_scalar('{}_{}'.format(prefix, key_name), value, epoch)
 
 
 def register_images(output_map, grapher, prefix='train'):
@@ -348,16 +354,17 @@ def register_images(output_map, grapher, prefix='train'):
     :rtype: None
 
     """
-    for k, v in output_map.items():
-        if isinstance(v, dict):
-            register_images(output_map[k], grapher, prefix=prefix)
+    if args.gpu == 0 and grapher is not None:  # Only send stuff to visdom once.
+        for k, v in output_map.items():
+            if isinstance(v, dict):
+                register_images(output_map[k], grapher, prefix=prefix)
 
-        if 'img' in k or 'imgs' in k:
-            key_name = '-'.join(k.split('_')[0:-1])
-            img = torchvision.utils.make_grid(v, normalize=True, scale_each=True)
-            grapher.add_image('{}_{}'.format(prefix, key_name),
-                              img.detach(),
-                              global_step=0)  # dont use step
+            if 'img' in k or 'imgs' in k:
+                key_name = '-'.join(k.split('_')[0:-1])
+                img = torchvision.utils.make_grid(v, normalize=True, scale_each=True)
+                grapher.add_image('{}_{}'.format(prefix, key_name),
+                                  img.detach(),
+                                  global_step=0)  # dont use step
 
 
 def _add_loss_map(loss_tm1, loss_t):
@@ -475,9 +482,9 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     loss_map = _mean_map(loss_map)                                             # reduce the map to get actual means
 
     # log some stuff
-    to_log = '{}[Epoch {}][{} samples][{:.2f} sec]:\t Loss: {:.4f}\t-ELBO: {:.4f}\tNLL: {:.4f}\tKLD: {:.4f}\tMI: {:.4f}'
+    to_log = '{}-{}[Epoch {}][{} samples][{:.2f} sec]:\t Loss: {:.4f}\t-ELBO: {:.4f}\tNLL: {:.4f}\tKLD: {:.4f}\tMI: {:.4f}'
     print(to_log.format(
-        prefix, epoch, num_samples, time.time() - start_time,
+        prefix, args.gpu, epoch, num_samples, time.time() - start_time,
         loss_map['loss_mean'].item(),
         loss_map['elbo_mean'].item(),
         loss_map['nll_mean'].item(),
@@ -514,7 +521,8 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
         image_map['generated_imgs'] = generated
 
     register_images({**image_map, **reconstr_map}, grapher, prefix=prefix)
-    grapher.save()
+    if grapher is not None:
+        grapher.save()
 
     # cleanups (see https://tinyurl.com/ycjre67m) + return ELBO for early stopping
     loss_val = loss_map['elbo_mean'].detach().item()
@@ -557,7 +565,7 @@ def test(epoch, model, test_loader, grapher, prefix='test'):
     return execute_graph(epoch, model, test_loader, grapher, prefix='test')
 
 
-def handle_multiprocessing_logic(rank, num_replicas, args):
+def handle_multiprocessing_logic(rank, num_replicas):
     """Sets the appropriate flags for multi-process jobs."""
     args.gpu = rank  # Set the GPU device to use
 
@@ -570,15 +578,16 @@ def handle_multiprocessing_logic(rank, num_replicas, args):
             # rank=int(os.environ["RANK"])
         )
 
+        # Update batch size appropriately
+        args.batch_size = args.batch_size // num_replicas
+
         # Set the cuda device
         torch.cuda.set_device(rank)
         print("Replica {} / {} using GPU: {}".format(
             rank + 1, num_replicas, torch.cuda.get_device_name(rank)))
 
-    return args
 
-
-def run(rank, num_replicas, args):
+def run(rank, num_replicas):
     """ Main entry-point into the program
 
     :param args: argparse
@@ -586,9 +595,9 @@ def run(rank, num_replicas, args):
     :rtype: None
 
     """
-    args = handle_multiprocessing_logic(rank, num_replicas, args)  # handle multi-process init logic
-    loader, model, grapher = build_loader_model_grapher(args)      # build the model, loader and grapher
-    optimizer, scheduler = build_optimizer(model)                  # the optimizer for the vae
+    handle_multiprocessing_logic(rank, num_replicas)            # handle multi-process init logic
+    loader, model, grapher = build_loader_model_grapher(args)   # build the model, loader and grapher
+    optimizer, scheduler = build_optimizer(model)               # the optimizer for the vae
     if args.half:
         model, optimizer = amp.initialize(model, optimizer, opt_level="O2")
 
@@ -608,6 +617,7 @@ def run(rank, num_replicas, args):
     for epoch in range(init_epoch, args.epochs + 1):
         train(epoch, model, optimizer, loader.train_loader, grapher)
         test_loss = test(epoch, model, loader.test_loader, grapher)
+        loader.set_all_epochs(epoch)  # set the epoch for distributed-multiprocessing
 
         # update the learning rate and plot it
         scheduler.step()
@@ -619,7 +629,7 @@ def run(rank, num_replicas, args):
             test_loss = test(epoch, model, loader.test_loader, grapher)
             break
 
-        if epoch == 2:  # make sure we do at least 1 test and train pass
+        if epoch == 2 and args.gpu == 0:  # make sure we do at least 1 test and train pass
             config_to_post = vars(args)
             slurm_id = utils.get_slurm_id()
             if slurm_id is not None:
@@ -628,9 +638,16 @@ def run(rank, num_replicas, args):
             grapher.add_text('config', pprint.PrettyPrinter(indent=4).pformat(config_to_post), 0)
 
     # cleanups
-    grapher.close()
+    if grapher is not None:
+        grapher.close()
 
 
 if __name__ == "__main__":
     print(pprint.PrettyPrinter(indent=4).pformat(vars(args)))
-    run(rank=1, num_replicas=args.num_replicas, args=args)  # Non-distributed launch
+    if args.num_replicas > 1:
+        os.environ['MASTER_ADDR'] = '127.0.0.1'
+        os.environ['MASTER_PORT'] = '29300'
+        mp.spawn(run, nprocs=args.num_replicas, args=(args.num_replicas,))
+    else:
+        # Non-distributed launch
+        run(rank=0, num_replicas=args.num_replicas)
