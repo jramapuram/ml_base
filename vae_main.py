@@ -97,14 +97,15 @@ parser.add_argument('--use-prior-kl', action='store_true',
                     help='add a kl on the VRNN prior against the true prior (default: False)')
 parser.add_argument('--use-noisy-rnn-state', action='store_true',
                     help='uses a noisy initial rnn state instead of zeros (default: False)')
-parser.add_argument('--max-time-steps', type=int, default=4,
-                    help='max time steps for RNN (default: 4)')
+parser.add_argument('--max-time-steps', type=int, default=0,
+                    help='max time steps for RNN or MSGVAE (default: 0)')
 parser.add_argument('--mut-clamp-strategy', type=str, default="clamp",
                     help='clamp mut info by norm / clamp / none (default: clamp)')
 parser.add_argument('--mut-clamp-value', type=float, default=100.0,
                     help='max / min clamp value if above strategy is clamp (default: 100.0)')
 
 # Regularizer
+parser.add_argument('--kl-annealing-cycles', type=int, default=None, help='cycles for kl-annealing (default: None)')
 parser.add_argument('--kl-beta', type=float, default=1, help='beta-vae kl term (default: 1)')
 parser.add_argument('--weight-decay', type=float, default=0, help='weight decay (default: 0)')
 parser.add_argument('--polyak-ema', type=float, default=0, help='Polyak weight averaging co-ef (default: 0)')
@@ -144,6 +145,10 @@ parser.add_argument('--num-replicas', type=int, default=1,
                     help='number of compute devices available; 1 means just local (default: 1)')
 parser.add_argument('--workers-per-replica', type=int, default=2,
                     help='threads per replica for the data loader (default: 2)')
+parser.add_argument('--distributed-master', type=str, default='127.0.0.1',
+                    help='hostname or IP to use for distributed master (default: 127.0.0.1)')
+parser.add_argument('--distributed-port', type=int, default=29300,
+                    help='port to use for distributed framework (default: 29300)')
 parser.add_argument('--debug-step', action='store_true', default=False,
                     help='only does one step of the execute_graph function per call instead of all minibatches')
 parser.add_argument('--seed', type=int, default=None,
@@ -154,28 +159,17 @@ parser.add_argument('--half', action='store_true', default=False,
                     help='enables half precision training')
 
 args = parser.parse_args()
-args.cuda = not args.no_cuda and torch.cuda.is_available()
-if args.cuda:
-    torch.backends.cudnn.benchmark = True
+
+# import half-precision imports
+if args.half:
+    from apex.fp16_utils import *
+    from apex import amp, optimizers
+
 
 # add aws job ID to config if it exists
 aws_instance_id = utils.get_aws_instance_id()
 if aws_instance_id is not None:
     args.instance_id = aws_instance_id
-
-# import half-precision imports
-if args.half:
-    from apex.parallel import DistributedDataParallel as DDP
-    from apex.fp16_utils import *
-    from apex import amp, optimizers
-
-# set a fixed seed for GPUs and CPU
-if args.seed is not None:
-    print("setting seed %d" % args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if args.cuda:
-        torch.cuda.manual_seed_all(args.seed)
 
 
 def build_lr_schedule(optimizer, last_epoch=-1):
@@ -223,6 +217,10 @@ def build_optimizer(model, last_epoch=-1):
     params_to_optimize = layers.add_weight_decay(model, args.weight_decay)
     full_opt_name = args.optimizer.lower().strip()
     is_lars = 'lars' in full_opt_name
+    if full_opt_name == 'lamb':  # Lazy add this.
+        assert args.half, "Need fp16 precision to use Apex FusedLAMB."
+        optim_map['lamb'] = optimizers.fused_lamb.FusedLAMB
+
     opt_name = full_opt_name.split('_')[-1] if is_lars else full_opt_name
     print("using {} optimizer {} lars.".format(opt_name, 'with'if is_lars else 'without'))
 
@@ -232,7 +230,7 @@ def build_optimizer(model, last_epoch=-1):
 
     # Wrap it with LARS if requested
     if is_lars:
-        opt = LARS(opt)
+        opt = LARS(opt, eps=0.0)
 
     # Build the schedule and return
     sched = build_lr_schedule(opt, last_epoch=last_epoch)
@@ -251,33 +249,49 @@ def build_loader_model_grapher(args):
     resize_shape = (args.image_size_override, args.image_size_override)
     resize_xform = transforms.Resize(resize_shape) if args.image_size_override \
         else transforms.Lambda(lambda x: x)
-    train_transform = [transforms.CenterCrop(160),
-                       resize_xform,
-                       transforms.RandomApply([transforms.ColorJitter(0.8, 0.8, 0.2)], p=0.8),
-                       transforms.RandomGrayscale(p=0.1),
-                       transforms.RandomHorizontalFlip(p=0.5),
-                       transforms.ToTensor(),
-                       # transforms.RandomApply([transforms.Lambda(lambda x: x + torch.randn(x.shape)*0.02)], p=0.5)]
-                       ]
-    test_transform = [transforms.CenterCrop(160),
-                      resize_xform]
+
+    # Build the required transforms for our dataset, eg below:
+    # train_transform = [
+    #     transforms.CenterCrop(160),
+    #     resize_xform,
+    #     transforms.RandomApply([transforms.ColorJitter(0.8, 0.8, 0.2)], p=0.8),
+    #     transforms.RandomGrayscale(p=0.1),
+    #     transforms.RandomHorizontalFlip(p=0.5),
+    #     transforms.ToTensor(),
+    #     transforms.RandomApply([transforms.Lambda(lambda x: x + torch.randn(x.shape)*0.02)], p=0.5)]
+    # ]
+    # test_transform = [
+    #     transforms.CenterCrop(160), resize_xform
+    # ]
+    train_transform = [resize_xform]
+    test_transform = [resize_xform]
+
     loader_dict = {'train_transform': train_transform,
-                   'test_transform': test_transform,
-                   **vars(args)}
+                   'test_transform': test_transform, **vars(args)}
     loader = get_loader(**loader_dict)
 
-    # set the input tensor shape (ignoring batch dimension)
+    # set the input tensor shape (ignoring batch dimension) and related dataset sizing
     args.input_shape = loader.input_shape
+    args.num_train_samples = loader.num_train_samples
+    args.num_test_samples = loader.num_test_samples
+    args.num_valid_samples = loader.num_valid_samples
+    args.steps_per_epoch = int(args.num_train_samples / args.batch_size)  # drop-remainder
+    args.total_steps = args.epochs * args.steps_per_epoch
 
     # build the network
     network = build_vae(args.vae_type)(loader.input_shape, kwargs=deepcopy(vars(args)))
-    network = network.cuda(args.gpu) if args.cuda else network
+    network = network.cuda() if args.cuda else network
     lazy_generate_modules(network, loader.train_loader)
     network = layers.init_weights(network, init=args.weight_initialization)
 
     if args.num_replicas > 1:
         print("data-paralleling...")
-        network.parallel([args.gpu])
+        network = layers.DistributedDataParallelPassthrough(network,
+                                                            device_ids=[0],
+                                                            output_device=0,
+                                                            # device_ids=[args.gpu],
+                                                            # output_device=args.gpu,
+                                                            find_unused_parameters=True)
 
     # Get some info about the structure and number of params.
     print(network)
@@ -310,7 +324,7 @@ def lazy_generate_modules(model, loader):
     model.config['half'] = False  # disable half here due to CPU weights
     for minibatch, labels in loader:
         with torch.no_grad():
-            minibatch = minibatch.cuda(args.gpu, non_blocking=True) if args.cuda else minibatch
+            minibatch = minibatch.cuda(non_blocking=True) if args.cuda else minibatch
             _ = model(minibatch)
             break
 
@@ -438,10 +452,8 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
 
     # iterate over data and labels
     for minibatch, labels in loader:
-        minibatch = minibatch.cuda(args.gpu, non_blocking=True) if args.cuda else minibatch
-        labels = labels.cuda(args.gpu, non_blocking=True) if args.cuda else labels
-        # if args.half:
-        #     minibatch = minibatch.half()
+        minibatch = minibatch.cuda(non_blocking=True) if args.cuda else minibatch
+        labels = labels.cuda(non_blocking=True) if args.cuda else labels
 
         with torch.no_grad() if prefix == 'test' else utils.dummy_context():
             if is_eval and args.polyak_ema > 0:                                # use the Polyak model for predictions
@@ -565,26 +577,34 @@ def test(epoch, model, test_loader, grapher, prefix='test'):
     return execute_graph(epoch, model, test_loader, grapher, prefix='test')
 
 
-def handle_multiprocessing_logic(rank, num_replicas):
+def init_multiprocessing_and_cuda(rank, num_replicas):
     """Sets the appropriate flags for multi-process jobs."""
-    args.gpu = rank  # Set the GPU device to use
+    args.gpu = rank  # Set the GPU device to use and correct cuda flags
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(rank)  # Set the cuda device (internal torch fn fails).
+
+    # Set CUDA after setting environment variable.
+    args.cuda = not args.no_cuda and torch.cuda.is_available()
+    if args.cuda:
+        torch.backends.cudnn.benchmark = True
+        print("Replica {} / {} using GPU: {}".format(
+            rank + 1, num_replicas, torch.cuda.get_device_name(0)))
+
+    # set a fixed seed for GPUs and CPU
+    if args.seed is not None:
+        print("setting seed %d" % args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if args.cuda:
+            torch.cuda.manual_seed_all(args.seed)
 
     if num_replicas > 1:
-        os.environ['MASTER_ADDR'] = '127.0.0.1'
-        os.environ['MASTER_PORT'] = '29300'
         torch.distributed.init_process_group(
             backend='nccl', init_method='env://',
             world_size=args.num_replicas, rank=rank
-            # rank=int(os.environ["RANK"])
         )
 
         # Update batch size appropriately
         args.batch_size = args.batch_size // num_replicas
-
-        # Set the cuda device
-        torch.cuda.set_device(rank)
-        print("Replica {} / {} using GPU: {}".format(
-            rank + 1, num_replicas, torch.cuda.get_device_name(rank)))
 
 
 def run(rank, num_replicas):
@@ -595,7 +615,7 @@ def run(rank, num_replicas):
     :rtype: None
 
     """
-    handle_multiprocessing_logic(rank, num_replicas)            # handle multi-process init logic
+    init_multiprocessing_and_cuda(rank, num_replicas)            # handle multi-process init logic
     loader, model, grapher = build_loader_model_grapher(args)   # build the model, loader and grapher
     optimizer, scheduler = build_optimizer(model)               # the optimizer for the vae
     if args.half:
@@ -645,8 +665,8 @@ def run(rank, num_replicas):
 if __name__ == "__main__":
     print(pprint.PrettyPrinter(indent=4).pformat(vars(args)))
     if args.num_replicas > 1:
-        os.environ['MASTER_ADDR'] = '127.0.0.1'
-        os.environ['MASTER_PORT'] = '29300'
+        os.environ['MASTER_ADDR'] = args.distributed_master
+        os.environ['MASTER_PORT'] = str(args.distributed_port)
         mp.spawn(run, nprocs=args.num_replicas, args=(args.num_replicas,))
     else:
         # Non-distributed launch

@@ -90,8 +90,7 @@ class LARS(Optimizer):
                     # Add weight decay before computing adaptive LR
                     # Seems to be pretty important in SIMclr style models.
                     if weight_decay > 0:
-                        # print("addding weight decay to param of shape {}".format(p.shape))
-                        p.grad.add_(weight_decay, p.data)
+                        p.grad = p.grad.add(p, alpha=weight_decay)
 
                     # Ignore bias / bn terms for LARS update
                     if ignore is not None and not ignore:
@@ -105,7 +104,7 @@ class LARS(Optimizer):
                             adaptive_lr = self.trust_coef * param_norm / (grad_norm + self.eps)
 
                         # print("applying {} lr scaling to param of shape {}".format(adaptive_lr, p.shape))
-                        p.grad.mul_(adaptive_lr)
+                        p.grad = p.grad.mul(adaptive_lr)
 
     def step(self, *args, **kwargs):
         self.apply_adaptive_lrs()

@@ -1,4 +1,4 @@
-FROM nvidia/cuda:10.0-cudnn7-devel-ubuntu16.04
+FROM nvidia/cuda:10.1-cudnn7-devel-ubuntu16.04
 ARG PYTHON_VERSION=3.7
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -19,16 +19,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # install base conda
 RUN curl -L https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -o Anaconda_37.sh && \
-        sh ./Anaconda*.sh -b -p /opt/conda && rm ./Anaconda*.sh
+    sh ./Anaconda*.sh -b -p /opt/conda && rm ./Anaconda*.sh
 ENV PATH /opt/conda/bin:$PATH
 
 # install conda deps
 RUN /opt/conda/bin/conda install numpy pandas scipy scikit-image scikit-learn h5py matplotlib && \
-    /opt/conda/bin/conda install pytorch=1.4.0 torchvision cudatoolkit=10.0 -c pytorch && \
+    /opt/conda/bin/conda install pytorch=1.5.0 torchvision cudatoolkit=10.1 -c pytorch && \
     /opt/conda/bin/conda install -y -c conda-forge opencv pyvips
 
 # install misc conda / pip deps
-# jax jaxlib tensorflow-gpu==1.14
+# consider installing jax jaxlib tensorflow-gpu==1.14
 RUN /opt/conda/bin/pip install torchvision tqdm msgpack joblib visdom rpyc \
     pyro-ppl tensorboardX psutil dm-tree tensorflow==1.14 && \
     /opt/conda/bin/conda install -c defaults libprotobuf protobuf
