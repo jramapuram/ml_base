@@ -93,9 +93,9 @@ parser.add_argument('--model-dir', type=str, default='.models',
 # RNN Related
 parser.add_argument('--clip', type=float, default=0,
                     help='gradient clipping for RNN (default: 0.25)')
-parser.add_argument('--use-prior-kl', action='store_true',
+parser.add_argument('--use-prior-kl', action='store_true', default=False,
                     help='add a kl on the VRNN prior against the true prior (default: False)')
-parser.add_argument('--use-noisy-rnn-state', action='store_true',
+parser.add_argument('--use-noisy-rnn-state', action='store_true', default=False,
                     help='uses a noisy initial rnn state instead of zeros (default: False)')
 parser.add_argument('--max-time-steps', type=int, default=0,
                     help='max time steps for RNN or MSGVAE (default: 0)')
@@ -131,7 +131,7 @@ parser.add_argument('--warmup', type=int, default=3,
                     help='warmup epochs (default: 0)')
 parser.add_argument('--optimizer', type=str, default="adam",
                     help="specify optimizer (default: adam)")
-parser.add_argument('--early-stop', action='store_true',
+parser.add_argument('--early-stop', action='store_true', default=False,
                     help='enable early stopping (default: False)')
 
 # Visdom parameters
@@ -272,11 +272,11 @@ def build_loader_model_grapher(args):
 
     # set the input tensor shape (ignoring batch dimension) and related dataset sizing
     args.input_shape = loader.input_shape
-    args.num_train_samples = loader.num_train_samples
-    args.num_test_samples = loader.num_test_samples
-    args.num_valid_samples = loader.num_valid_samples
-    args.steps_per_epoch = int(args.num_train_samples / args.batch_size)  # drop-remainder
-    args.total_steps = args.epochs * args.steps_per_epoch
+    args.num_train_samples = loader.num_train_samples // args.num_replicas
+    args.num_test_samples = loader.num_test_samples  # Test isn't currently split across devices
+    args.num_valid_samples = loader.num_valid_samples // args.num_replicas
+    args.steps_per_train_epoch = args.num_train_samples // args.batch_size  # drop-remainder
+    args.total_train_steps = args.epochs * args.steps_per_train_epoch
 
     # build the network
     network = build_vae(args.vae_type)(loader.input_shape, kwargs=deepcopy(vars(args)))
@@ -567,7 +567,7 @@ def test(epoch, model, test_loader, grapher, prefix='test'):
 
     :param epoch: the current epoch
     :param model: the model
-    :param test_loader: the test data-loader
+    :param test_loader: the test data-loaderpp
     :param grapher: the grapher object
     :param prefix: the default prefix; useful if we have multiple test types
     :returns: mean ELBO scalar
@@ -615,15 +615,17 @@ def run(rank, num_replicas):
     :rtype: None
 
     """
-    init_multiprocessing_and_cuda(rank, num_replicas)            # handle multi-process init logic
+    init_multiprocessing_and_cuda(rank, num_replicas)           # handle multi-process + cuda init logic
     loader, model, grapher = build_loader_model_grapher(args)   # build the model, loader and grapher
+    print(pprint.PrettyPrinter(indent=4).pformat(vars(args)))   # print the config to stdout (after ddp changes)
     optimizer, scheduler = build_optimizer(model)               # the optimizer for the vae
     if args.half:
         model, optimizer = amp.initialize(model, optimizer, opt_level="O2")
 
     # build the early-stopping (or best-saver) objects and restore if we had a previous model
     model = layers.append_save_and_load_fns(model, optimizer, scheduler, grapher, args)
-    saver = layers.ModelSaver(args, model, burn_in_interval=int(0.1 * args.epochs),
+    saver = layers.ModelSaver(model, early_stop=args.early_stop, gpu=args.gpu,
+                              burn_in_interval=int(0.1 * args.epochs),  # Avoid tons of saving early on.
                               larger_is_better=False, max_early_stop_steps=10)
     restore_dict = saver.restore()
     init_epoch = restore_dict['epoch']
@@ -663,7 +665,6 @@ def run(rank, num_replicas):
 
 
 if __name__ == "__main__":
-    print(pprint.PrettyPrinter(indent=4).pformat(vars(args)))
     if args.num_replicas > 1:
         os.environ['MASTER_ADDR'] = args.distributed_master
         os.environ['MASTER_PORT'] = str(args.distributed_port)
