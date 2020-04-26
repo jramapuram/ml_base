@@ -287,10 +287,8 @@ def build_loader_model_grapher(args):
     if args.num_replicas > 1:
         print("data-paralleling...")
         network = layers.DistributedDataParallelPassthrough(network,
-                                                            device_ids=[0],
-                                                            output_device=0,
-                                                            # device_ids=[args.gpu],
-                                                            # output_device=args.gpu,
+                                                            device_ids=[0],   # set w/cuda environ var
+                                                            output_device=0,  # set w/cuda environ var
                                                             find_unused_parameters=True)
 
     # Get some info about the structure and number of params.

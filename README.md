@@ -18,8 +18,16 @@ git push -f                                                                     
 
 #### Example resnet18 classifier project
 
+Change the transforms in `supervised_main.py` appropriately for cifar10 and:
+
 ``` bash
-python main.py --task=cifar10
+python supervised_main.py --task=cifar10
+```
+
+More complex example:
+
+``` bash
+python supervised_main.py --lr-update-schedule=cosine --warmup=10 --optimizer=lars_adam --lr=1e-3 --task=imagefolder --data-dir=$HOME/datasets/imagenet --batch-size=64 --visdom-url=http://localhost --visdom-port=8097 --epochs=50 --debug-step --polyak-ema=0 --weight-decay=1e-6 --model-dir=.models --arch=resnet50 --uid=supv00_0
 ```
 
 
