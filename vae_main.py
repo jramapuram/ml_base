@@ -147,6 +147,8 @@ parser.add_argument('--workers-per-replica', type=int, default=2,
                     help='threads per replica for the data loader (default: 2)')
 parser.add_argument('--distributed-master', type=str, default='127.0.0.1',
                     help='hostname or IP to use for distributed master (default: 127.0.0.1)')
+parser.add_argument('--distributed-rank', type=int, default=0,
+                    help='rank of the current replica in the world (default: 0)')
 parser.add_argument('--distributed-port', type=int, default=29300,
                     help='port to use for distributed framework (default: 29300)')
 parser.add_argument('--debug-step', action='store_true', default=False,
@@ -237,6 +239,46 @@ def build_optimizer(model, last_epoch=-1):
     return opt, sched
 
 
+def build_train_and_test_transforms():
+    """Returns torchvision OR nvidia-dali transforms.
+
+    :returns: train_transforms, test_transforms
+    :rtype: list, list
+
+    """
+    resize_shape = (args.image_size_override, args.image_size_override)
+
+    if 'dali' in args.task:
+        # Lazy import DALI dependencies because debug cpu nodes might not have DALI.
+        import nvidia.dali.ops as ops
+        import nvidia.dali.types as types
+
+        train_transform, test_transform = None, None
+        if args.image_size_override:
+            train_transform = [
+                ops.Resize(resize_x=resize_shape[0],
+                           resize_y=resize_shape[1],
+                           device="gpu" if args.cuda else "cpu",
+                           image_type=types.RGB,
+                           interp_type=types.INTERP_LINEAR)
+            ]
+            test_transform = [
+                ops.Resize(resize_x=resize_shape[0],
+                           resize_y=resize_shape[1],
+                           device="gpu" if args.cuda else "cpu",
+                           image_type=types.RGB,
+                           interp_type=types.INTERP_LINEAR)
+            ]
+    else:
+        resize_shape = (args.image_size_override, args.image_size_override)
+        resize_xform = transforms.Resize(resize_shape) if args.image_size_override \
+            else transforms.Lambda(lambda x: x)
+        train_transform = [resize_xform]
+        test_transform = [resize_xform]
+
+    return train_transform, test_transform
+
+
 def build_loader_model_grapher(args):
     """builds a model, a dataloader and a grapher
 
@@ -246,26 +288,7 @@ def build_loader_model_grapher(args):
     :rtype: list
 
     """
-    resize_shape = (args.image_size_override, args.image_size_override)
-    resize_xform = transforms.Resize(resize_shape) if args.image_size_override \
-        else transforms.Lambda(lambda x: x)
-
-    # Build the required transforms for our dataset, eg below:
-    # train_transform = [
-    #     transforms.CenterCrop(160),
-    #     resize_xform,
-    #     transforms.RandomApply([transforms.ColorJitter(0.8, 0.8, 0.2)], p=0.8),
-    #     transforms.RandomGrayscale(p=0.1),
-    #     transforms.RandomHorizontalFlip(p=0.5),
-    #     transforms.ToTensor(),
-    #     transforms.RandomApply([transforms.Lambda(lambda x: x + torch.randn(x.shape)*0.02)], p=0.5)]
-    # ]
-    # test_transform = [
-    #     transforms.CenterCrop(160), resize_xform
-    # ]
-    train_transform = [resize_xform]
-    test_transform = [resize_xform]
-
+    train_transform, test_transform = build_train_and_test_transforms()
     loader_dict = {'train_transform': train_transform,
                    'test_transform': test_transform, **vars(args)}
     loader = get_loader(**loader_dict)
@@ -285,7 +308,7 @@ def build_loader_model_grapher(args):
     network = layers.init_weights(network, init=args.weight_initialization)
 
     if args.num_replicas > 1:
-        print("data-paralleling...")
+        print("wrapping model with DDP...")
         network = layers.DistributedDataParallelPassthrough(network,
                                                             device_ids=[0],   # set w/cuda environ var
                                                             output_device=0,  # set w/cuda environ var
@@ -299,12 +322,12 @@ def build_loader_model_grapher(args):
 
     # build the grapher object
     grapher = None
-    if args.visdom_url and args.gpu == 0:
+    if args.visdom_url is not None and args.distributed_rank == 0:
         grapher = Grapher('visdom', env=utils.get_name(args),
                           server=args.visdom_url,
                           port=args.visdom_port)
-    elif args.gpu == 0:
-        grapher = Grapher('tensorboard', comment=utils.get_name(args))
+    elif args.distributed_rank == 0:
+        grapher = Grapher('tensorboard', logdir=os.path.join('runs', utils.get_name(args)))
 
     return loader, network, grapher
 
@@ -345,7 +368,7 @@ def register_plots(loss, grapher, epoch, prefix='train'):
     :rtype: None
 
     """
-    if args.gpu == 0 and grapher is not None:  # Only send stuff to visdom once.
+    if args.distributed_rank == 0 and grapher is not None:  # Only send stuff to visdom once.
         for k, v in loss.items():
             if isinstance(v, dict):
                 register_plots(loss[k], grapher, epoch, prefix=prefix)
@@ -366,7 +389,7 @@ def register_images(output_map, grapher, prefix='train'):
     :rtype: None
 
     """
-    if args.gpu == 0 and grapher is not None:  # Only send stuff to visdom once.
+    if args.distributed_rank == 0 and grapher is not None:  # Only send stuff to visdom once.
         for k, v in output_map.items():
             if isinstance(v, dict):
                 register_images(output_map[k], grapher, prefix=prefix)
@@ -476,8 +499,7 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
             if args.clip > 0:
                 # TODO: clip by value or norm? torch.nn.utils.clip_grad_value_
                 # torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip) \
-                nn.utils.clip_grad_value_(model.parameters(), args.clip) \
-                    if not args.half else optimizer.clip_master_grads(args.clip)
+                nn.utils.clip_grad_value_(model.parameters(), args.clip)
 
             optimizer.step()
             if args.polyak_ema > 0:                                            # update Polyak mean if requested
@@ -494,7 +516,7 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     # log some stuff
     to_log = '{}-{}[Epoch {}][{} samples][{:.2f} sec]:\t Loss: {:.4f}\t-ELBO: {:.4f}\tNLL: {:.4f}\tKLD: {:.4f}\tMI: {:.4f}'
     print(to_log.format(
-        prefix, args.gpu, epoch, num_samples, time.time() - start_time,
+        prefix, args.distributed_rank, epoch, num_samples, time.time() - start_time,
         loss_map['loss_mean'].item(),
         loss_map['elbo_mean'].item(),
         loss_map['nll_mean'].item(),
@@ -575,37 +597,44 @@ def test(epoch, model, test_loader, grapher, prefix='test'):
     return execute_graph(epoch, model, test_loader, grapher, prefix='test')
 
 
-def init_multiprocessing_and_cuda(rank, num_replicas):
+def init_multiprocessing_and_cuda(rank, args_from_spawn):
     """Sets the appropriate flags for multi-process jobs."""
-    args.gpu = rank  # Set the GPU device to use and correct cuda flags
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(rank)  # Set the cuda device (internal torch fn fails).
+    if args_from_spawn.multi_gpu_distributed:
+        # Force set the GPU device in the case where a single node has >1 GPU
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(rank)
+        args_from_spawn.distributed_rank = rank
 
-    # Set CUDA after setting environment variable.
-    args.cuda = not args.no_cuda and torch.cuda.is_available()
-    if args.cuda:
+    # Set the cuda flag appropriately
+    args_from_spawn.cuda = not args_from_spawn.no_cuda and torch.cuda.is_available()
+    if args_from_spawn.cuda:
         torch.backends.cudnn.benchmark = True
         print("Replica {} / {} using GPU: {}".format(
-            rank + 1, num_replicas, torch.cuda.get_device_name(0)))
+            rank + 1, args_from_spawn.num_replicas, torch.cuda.get_device_name(0)))
 
     # set a fixed seed for GPUs and CPU
-    if args.seed is not None:
-        print("setting seed %d" % args.seed)
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
-        if args.cuda:
-            torch.cuda.manual_seed_all(args.seed)
+    if args_from_spawn.seed is not None:
+        print("setting seed %d" % args_from_spawn.seed)
+        np.random.seed(args_from_spawn.seed)
+        torch.manual_seed(args_from_spawn.seed)
+        if args_from_spawn.cuda:
+            torch.cuda.manual_seed_all(args_from_spawn.seed)
 
-    if num_replicas > 1:
+    if args_from_spawn.num_replicas > 1:
         torch.distributed.init_process_group(
-            backend='nccl', init_method='env://',
-            world_size=args.num_replicas, rank=rank
+            backend='nccl', init_method=os.environ['MASTER_ADDR'],
+            world_size=args_from_spawn.num_replicas, rank=rank
         )
+        print("Successfully created DDP process group!")
 
         # Update batch size appropriately
-        args.batch_size = args.batch_size // num_replicas
+        args_from_spawn.batch_size = args_from_spawn.batch_size // args_from_spawn.num_replicas
+
+    # set the global argparse
+    global args
+    args = args_from_spawn
 
 
-def run(rank, num_replicas):
+def run(rank, args):
     """ Main entry-point into the program
 
     :param args: argparse
@@ -613,16 +642,16 @@ def run(rank, num_replicas):
     :rtype: None
 
     """
-    init_multiprocessing_and_cuda(rank, num_replicas)           # handle multi-process + cuda init logic
+    init_multiprocessing_and_cuda(rank, args)                   # handle multi-process + cuda init logic
     loader, model, grapher = build_loader_model_grapher(args)   # build the model, loader and grapher
     print(pprint.PrettyPrinter(indent=4).pformat(vars(args)))   # print the config to stdout (after ddp changes)
     optimizer, scheduler = build_optimizer(model)               # the optimizer for the vae
     if args.half:
-        model, optimizer = amp.initialize(model, optimizer, opt_level="O2")
+        model, optimizer = amp.initialize(model, optimizer, opt_level="O1")
 
     # build the early-stopping (or best-saver) objects and restore if we had a previous model
     model = layers.append_save_and_load_fns(model, optimizer, scheduler, grapher, args)
-    saver = layers.ModelSaver(model, early_stop=args.early_stop, gpu=args.gpu,
+    saver = layers.ModelSaver(model, early_stop=args.early_stop, rank=rank,
                               burn_in_interval=int(0.1 * args.epochs),  # Avoid tons of saving early on.
                               larger_is_better=False, max_early_stop_steps=10)
     restore_dict = saver.restore()
@@ -649,7 +678,7 @@ def run(rank, num_replicas):
             test_loss = test(epoch, model, loader.test_loader, grapher)
             break
 
-        if epoch == 2 and args.gpu == 0:  # make sure we do at least 1 test and train pass
+        if epoch == 2 and args.distributed_rank == 0:  # make sure we do at least 1 test and train pass
             config_to_post = vars(args)
             slurm_id = utils.get_slurm_id()
             if slurm_id is not None:
@@ -663,10 +692,31 @@ def run(rank, num_replicas):
 
 
 if __name__ == "__main__":
+    args.multi_gpu_distributed = False  # automagically detected and set below
+
     if args.num_replicas > 1:
-        os.environ['MASTER_ADDR'] = args.distributed_master
+        # Distributed launch
+        assert args.distributed_master is not None, "Specify --distributed-master for DDP."
+
+        # Set some environment flags
+        endpoint = '{}{}:{}'.format('tcp://' if 'tcp' not in args.distributed_master else '',
+                                    args.distributed_master, args.distributed_port)
+        os.environ['MASTER_ADDR'] = endpoint
         os.environ['MASTER_PORT'] = str(args.distributed_port)
-        mp.spawn(run, nprocs=args.num_replicas, args=(args.num_replicas,))
+
+        # Spawn processes if we have a special case of big node with 4 or 8 GPUs.
+        num_gpus = utils.number_of_gpus()
+        if num_gpus == args.num_replicas:  # Special case
+            # Multiple devices in this process, convert to single processed
+            print("detected single node - multi gpu setup: spawning processes")
+            args.multi_gpu_distributed = True
+            mp.spawn(run, nprocs=args.num_replicas, args=(args,))
+        else:
+            # Single device in this entire process
+            print("detected distributed with 1 gpu - 1 process setup")
+            assert num_gpus == 1, "Only 1 GPU per process supported; filter with CUDA_VISIBLE_DEVICES."
+            run(rank=args.distributed_rank, args=args)
+
     else:
         # Non-distributed launch
-        run(rank=0, num_replicas=args.num_replicas)
+        run(rank=0, args=args)
