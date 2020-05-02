@@ -226,8 +226,12 @@ def build_optimizer(model, last_epoch=-1):
     opt_name = full_opt_name.split('_')[-1] if is_lars else full_opt_name
     print("using {} optimizer {} lars.".format(opt_name, 'with'if is_lars else 'without'))
 
-    # Build the base optimizer
-    lr = args.lr * (args.batch_size / 256) if opt_name not in ["adam", "rmsprop"] else args.lr  # Following SimCLR
+    # Compute the LR and update according to batch size
+    lr = args.lr
+    if opt_name in ["momentum", "sgd"]:
+        lr = args.lr * (args.batch_size * args.num_replicas / 256)
+
+    # build the actual optimizer
     opt = optim_map[opt_name](params_to_optimize, lr=lr)
 
     # Wrap it with LARS if requested
