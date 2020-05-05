@@ -502,7 +502,7 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
 
             if args.clip > 0:
                 # TODO: clip by value or norm? torch.nn.utils.clip_grad_value_
-                # torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip) \
+                # torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
                 nn.utils.clip_grad_value_(model.parameters(), args.clip)
 
             optimizer.step()
