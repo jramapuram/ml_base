@@ -12,5 +12,28 @@ echo "executing: $CMD "
 GPU=${2:-0}
 echo "using GPU: $GPU"
 
-# execute it in docker
-nvidia-docker run --ipc=host -v $HOME/datasets:/datasets -v $HOME/models:/models -v ${ROOT_DIR}:/workspace -e NVIDIA_VISIBLE_DEVICES=$GPU -it jramapuram/pytorch:1.5.0-cuda10.1 $CMD
+# check if we have a port arg
+PORT=${3:-0}
+
+# if [ -z ${PORT+x} ]; then
+if [ $PORT == 0 ]; then
+    # execute it in docker
+    nvidia-docker run --ipc=host \
+                  -v $HOME/datasets:/datasets \
+                  -v $HOME/models:/models \
+                  -v ${ROOT_DIR}:/workspace \
+                  -e NVIDIA_VISIBLE_DEVICES=$GPU \
+                  -it jramapuram/pytorch:1.5.0-cuda10.1 $CMD ;
+else
+    # share the requested ports
+    echo "exposing port: $PORT"
+
+    # execute it in docker
+    nvidia-docker run --ipc=host \
+                  -v $HOME/datasets:/datasets \
+                  -v $HOME/models:/models \
+                  -v ${ROOT_DIR}:/workspace \
+                  -p $PORT:$PORT \
+                  -e NVIDIA_VISIBLE_DEVICES=$GPU \
+                  -it jramapuram/pytorch:1.5.0-cuda10.1 $CMD ;
+fi

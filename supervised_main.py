@@ -1,5 +1,6 @@
 import os
 import time
+import tree
 import argparse
 import functools
 import pprint
@@ -66,6 +67,8 @@ parser.add_argument('--weight-decay', type=float, default=0, help='weight decay 
 parser.add_argument('--polyak-ema', type=float, default=0, help='Polyak weight averaging co-ef (default: 0)')
 parser.add_argument('--convert-to-sync-bn', action='store_true', default=False,
                     help='converts all BNs to SyncBNs (default: False)')
+parser.add_argument('--color-jitter-strength', type=float, default=1.0,
+                    help='scalar weighting for the color jitter (default: 1.0)')
 
 # Optimization related
 parser.add_argument('--clip', type=float, default=0,
@@ -190,40 +193,36 @@ def build_optimizer(model, last_epoch=-1):
     return opt, sched
 
 
-def build_train_and_test_transforms(first_center_crop_size=256):
+def build_train_and_test_transforms():
     """Returns torchvision OR nvidia-dali transforms.
 
-    :param first_center_crop_size: the first center crop before resize, etc
     :returns: train_transforms, test_transforms
     :rtype: list, list
 
     """
-    if args.image_size_override is not None:
-        assert first_center_crop_size > args.image_size_override, "First crop needs to be > image-size-override."
-
     resize_shape = (args.image_size_override, args.image_size_override)
 
-    if args.task == 'dali_image_folder':
+    if 'dali' in args.task:
         # Lazy import DALI dependencies because debug cpu nodes might not have DALI.
         import nvidia.dali.ops as ops
         import nvidia.dali.types as types
         from datasets.dali_imagefolder import ColorJitter, RandomHorizontalFlip
-
-        first_center_crop = (first_center_crop_size, first_center_crop_size)
 
         train_transform = [
             ops.RandomResizedCrop(device="gpu" if args.cuda else "cpu",
                                   size=resize_shape,
                                   random_area=(0.08, 1.0),
                                   random_aspect_ratio=(3./4, 4./3)),
-            ColorJitter(brightness=0.8, contrast=0.8, saturation=0.2, prob=0.8, cuda=args.cuda),
-            RandomHorizontalFlip(prob=0.2, cuda=args.cuda)
+            RandomHorizontalFlip(prob=0.2, cuda=args.cuda),
+            ColorJitter(brightness=0.8 * args.color_jitter_strength,
+                        contrast=0.8 * args.color_jitter_strength,
+                        saturation=0.2 * args.color_jitter_strength,
+                        hue=0.2 * args.color_jitter_strength,
+                        prob=0.8, cuda=args.cuda)
             #  RandomGrayScale(prob=1.0, cuda=args.cuda)  # currently does not work
+            # TODO: Gaussian-blur
         ]
         test_transform = [
-            ops.Resize(resize_shorter=first_center_crop_size,
-                       device="gpu" if args.cuda else "cpu"),
-            ops.Crop(device="gpu" if args.cuda else "cpu", crop=first_center_crop),
             ops.Resize(resize_x=resize_shape[0],
                        resize_y=resize_shape[1],
                        device="gpu" if args.cuda else "cpu",
@@ -231,21 +230,21 @@ def build_train_and_test_transforms(first_center_crop_size=256):
                        interp_type=types.INTERP_LINEAR)
         ]
     else:
-        resize_shape = (args.image_size_override, args.image_size_override)
-        resize_xform = transforms.Resize(resize_shape) if args.image_size_override \
-            else transforms.Lambda(lambda x: x)
+        from datasets.utils import GaussianBlur
 
-        # Build the required transforms for our dataset, eg below:
         train_transform = [
-            transforms.CenterCrop(first_center_crop_size),
-            resize_xform,
-            transforms.RandomApply([transforms.ColorJitter(0.8, 0.8, 0.2)], p=0.8),
-            transforms.RandomGrayscale(p=0.2),
+            # transforms.CenterCrop(first_center_crop_size),
+            transforms.RandomResizedCrop((args.image_size_override, args.image_size_override)),
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ToTensor(),
-            # transforms.RandomApply([transforms.Lambda(lambda x: x + torch.randn(x.shape)*0.02)], p=0.5)
+            transforms.RandomApply([transforms.ColorJitter(
+                brightness=0.8 * args.color_jitter_strength,
+                contrast=0.8 * args.color_jitter_strength,
+                saturation=0.8 * args.color_jitter_strength,
+                hue=0.2 * args.color_jitter_strength)], p=0.8),
+            transforms.RandomGrayscale(p=0.2),
+            GaussianBlur(kernel_size=int(0.1 * args.image_size_override), p=0.5)
         ]
-        test_transform = [transforms.CenterCrop(first_center_crop_size), resize_xform]
+        test_transform = [transforms.Resize(resize_shape)]
 
     return train_transform, test_transform
 
@@ -381,54 +380,16 @@ def register_images(output_map, grapher, prefix='train'):
                                   global_step=0)  # dont use step
 
 
-def _add_loss_map(loss_tm1, loss_t):
-    """ Adds the current dict _t to the previous running dict _tm1
+def _extract_sum_scalars(v1, v2):
+    """Simple helper to sum values in a struct using dm_tree."""
 
-    :param loss_tm1: a dict of previous losses
-    :param loss_t: a dict of the current losses
-    :returns: a new dict with added values and updated count
-    :rtype: dict
+    def chk(c):
+        """Helper to check if we have a primitive or tensor"""
+        return not isinstance(c, (int, float, np.int32, np.int64, np.float32, np.float64))
 
-    """
-    if not loss_tm1:  # base case: empty dict
-        resultant = {'count': 1}
-        for k, v in loss_t.items():
-            if 'mean' in k or 'scalar' in k:
-                if not isinstance(v, (float, int, np.float32, np.float64)):
-                    resultant[k] = v.detach()
-                else:
-                    resultant[k] = v
-
-        return resultant
-
-    resultant = {}
-    for (k, v) in loss_t.items():
-        if 'mean' in k or 'scalar' in k:
-            if not isinstance(v, (float, np.float32, np.float64)):
-                resultant[k] = loss_tm1[k] + v.detach()
-            else:
-                resultant[k] = loss_tm1[k] + v
-
-    # increment total count
-    resultant['count'] = loss_tm1['count'] + 1
-    return resultant
-
-
-def _mean_map(loss_map):
-    """ Simply scales all values in the dict by the count
-
-    :param loss_map: the dict of scalars
-    :returns: mean of the dict
-    :rtype: dict
-
-    """
-    for k in loss_map.keys():
-        if k == 'count':
-            continue
-
-        loss_map[k] /= loss_map['count']
-
-    return loss_map
+    v1_detached = v1.detach() if chk(v1) else v1
+    v2_detached = v2.detach() if chk(v2) else v2
+    return v1_detached + v2_detached
 
 
 def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
@@ -445,17 +406,17 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
 
     """
     start_time = time.time()
-    is_eval = prefix != 'train'
+    is_eval = 'train' not in prefix
     model.eval() if is_eval else model.train()
     assert optimizer is None if is_eval else optimizer is not None
     loss_map, num_samples = {}, 0
 
     # iterate over data and labels
-    for minibatch, labels in loader:
+    for num_minibatches, (minibatch, labels) in enumerate(loader):
         minibatch = minibatch.cuda(non_blocking=True) if args.cuda else minibatch
         labels = labels.cuda(non_blocking=True) if args.cuda else labels
 
-        with torch.no_grad() if prefix == 'test' else utils.dummy_context():
+        with torch.no_grad() if is_eval else utils.dummy_context():
             if is_eval and args.polyak_ema > 0:                                  # use the Polyak model for predictions
                 pred_logits = layers.get_polyak_prediction(
                     model, pred_fn=functools.partial(model, minibatch))
@@ -468,7 +429,8 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
                 'top1_mean': acc1,
                 'top5_mean': acc5,
             }
-            loss_map = _add_loss_map(loss_map, loss_t)                           # aggregate loss
+            loss_map = loss_t if not loss_map else tree.map_structure(           # aggregate loss
+                _extract_sum_scalars, loss_map, loss_t)
             num_samples += minibatch.size(0)                                     # count minibatch samples
 
         if not is_eval:                                                          # compute bp and optimize
@@ -493,8 +455,9 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
         if args.debug_step:  # for testing purposes
             break
 
-    # compute the mean of the map
-    loss_map = _mean_map(loss_map)                                             # reduce the map to get actual means
+    # compute the mean of the dict
+    loss_map = tree.map_structure(
+        lambda v: v / (num_minibatches + 1), loss_map)                          # reduce the map to get actual means
 
     # log some stuff
     to_log = '{}-{}[Epoch {}][{} samples][{:.2f} sec]:\t Loss: {:.4f}\tTop-1: {:.4f}\tTop-5: {:.4f}'
@@ -507,8 +470,12 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     # plot the test accuracy, loss and images
     register_plots({**loss_map}, grapher, epoch=epoch, prefix=prefix)
 
-    # tack on images to grapher
-    image_map = {'input_imgs': minibatch}
+    # tack on images to grapher, reducing size of image and the total samples for bandwidth
+    num_images_to_post = min(64, minibatch.shape[0])
+    image_size_to_post = min(64, minibatch.shape[-1])
+    images_to_post = F.interpolate(minibatch[0:num_images_to_post],
+                                   size=(image_size_to_post, image_size_to_post))
+    image_map = {'input_imgs': images_to_post}
     register_images({**image_map}, grapher, prefix=prefix)
     if grapher is not None:
         grapher.save()

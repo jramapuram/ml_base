@@ -1,5 +1,6 @@
 import os
 import time
+import tree
 import argparse
 import functools
 import pprint
@@ -21,7 +22,7 @@ import optimizers.scheduler as scheduler
 from models.vae import build_vae
 from datasets.loader import get_loader
 from helpers.grapher import Grapher
-from helpers.async_fid.client import FIDClient
+from helpers.fid_client import FIDClient
 from optimizers.lars import LARS
 
 
@@ -299,6 +300,7 @@ def build_loader_model_grapher(args):
 
     # set the input tensor shape (ignoring batch dimension) and related dataset sizing
     args.input_shape = loader.input_shape
+    args.output_size = loader.output_size
     args.num_train_samples = loader.num_train_samples // args.num_replicas
     args.num_test_samples = loader.num_test_samples  # Test isn't currently split across devices
     args.num_valid_samples = loader.num_valid_samples // args.num_replicas
@@ -346,19 +348,25 @@ def lazy_generate_modules(model, loader):
 
     """
     model.eval()
-    model.config['half'] = False  # disable half here due to CPU weights
     for minibatch, labels in loader:
         with torch.no_grad():
+            # Some sanity prints on the minibatch and labels
+            print("minibatch = {} / {} | labels = {} / {}".format(minibatch.shape,
+                                                                  minibatch.dtype,
+                                                                  labels.shape,
+                                                                  labels.dtype))
+            mb_min, mb_max = minibatch.min(), minibatch.max()
+            print("minibatch in range [min: {}, max: {}]".format(mb_min, mb_max))
+            if mb_max > 1.0 or mb_min < 0:
+                raise ValueError("Minibatch max > 1.0 or minibatch min < 0. You probably dont want this.")
+
             minibatch = minibatch.cuda(non_blocking=True) if args.cuda else minibatch
-            _ = model(minibatch)
+            _ = model(minibatch, labels=labels)
             break
 
     # initialize the polyak-ema op if it exists
     if hasattr(model, 'polyak_ema') and args.polyak_ema > 0:
         layers.polyak_ema_parameters(model, args.polyak_ema)
-
-    # reset half tensors if requested since torch.cuda.HalfTensor has impls
-    model.config['half'] = args.half
 
 
 def register_plots(loss, grapher, epoch, prefix='train'):
@@ -406,54 +414,16 @@ def register_images(output_map, grapher, prefix='train'):
                                   global_step=0)  # dont use step
 
 
-def _add_loss_map(loss_tm1, loss_t):
-    """ Adds the current dict _t to the previous running dict _tm1
+def _extract_sum_scalars(v1, v2):
+    """Simple helper to sum values in a struct using dm_tree."""
 
-    :param loss_tm1: a dict of previous losses
-    :param loss_t: a dict of the current losses
-    :returns: a new dict with added values and updated count
-    :rtype: dict
+    def chk(c):
+        """Helper to check if we have a primitive or tensor"""
+        return not isinstance(c, (int, float, np.int32, np.int64, np.float32, np.float64))
 
-    """
-    if not loss_tm1:  # base case: empty dict
-        resultant = {'count': 1}
-        for k, v in loss_t.items():
-            if 'mean' in k or 'scalar' in k:
-                if not isinstance(v, (float, int, np.float32, np.float64)):
-                    resultant[k] = v.detach()
-                else:
-                    resultant[k] = v
-
-        return resultant
-
-    resultant = {}
-    for (k, v) in loss_t.items():
-        if 'mean' in k or 'scalar' in k:
-            if not isinstance(v, (float, np.float32, np.float64)):
-                resultant[k] = loss_tm1[k] + v.detach()
-            else:
-                resultant[k] = loss_tm1[k] + v
-
-    # increment total count
-    resultant['count'] = loss_tm1['count'] + 1
-    return resultant
-
-
-def _mean_map(loss_map):
-    """ Simply scales all values in the dict by the count
-
-    :param loss_map: the dict of scalars
-    :returns: mean of the dict
-    :rtype: dict
-
-    """
-    for k in loss_map.keys():
-        if k == 'count':
-            continue
-
-        loss_map[k] /= loss_map['count']
-
-    return loss_map
+    v1_detached = v1.detach() if chk(v1) else v1
+    v2_detached = v2.detach() if chk(v2) else v2
+    return v1_detached + v2_detached
 
 
 def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
@@ -470,26 +440,27 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
 
     """
     start_time = time.time()
-    is_eval = prefix != 'train'
+    is_eval = 'train' not in prefix
     model.eval() if is_eval else model.train()
     assert optimizer is None if is_eval else optimizer is not None
     loss_map, num_samples = {}, 0
 
     # iterate over data and labels
-    for minibatch, labels in loader:
+    for num_minibatches, (minibatch, labels) in enumerate(loader):
         minibatch = minibatch.cuda(non_blocking=True) if args.cuda else minibatch
         labels = labels.cuda(non_blocking=True) if args.cuda else labels
 
-        with torch.no_grad() if prefix == 'test' else utils.dummy_context():
+        with torch.no_grad() if is_eval else utils.dummy_context():
             if is_eval and args.polyak_ema > 0:                                # use the Polyak model for predictions
                 pred_logits, reparam_map = layers.get_polyak_prediction(
-                    model, pred_fn=functools.partial(model, minibatch))
+                    model, pred_fn=functools.partial(model, minibatch, labels=labels))
             else:
-                pred_logits, reparam_map = model(minibatch)                    # get normal predictions
+                pred_logits, reparam_map = model(minibatch, labels=labels)     # get normal predictions
 
             loss_t = model.loss_function(pred_logits, minibatch, reparam_map,  # compute loss
                                          K=args.monte_carlo_posterior_samples)
-            loss_map = _add_loss_map(loss_map, loss_t)                         # aggregate loss
+            loss_map = loss_t if not loss_map else tree.map_structure(         # aggregate loss
+                _extract_sum_scalars, loss_map, loss_t)
             num_samples += minibatch.size(0)                                   # count minibatch samples
 
         if not is_eval:                                                        # compute bp and optimize
@@ -511,11 +482,12 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
 
             del loss_t
 
-        if args.debug_step:  # for testing purposes
+        if args.debug_step and num_minibatches > 1:  # for testing purposes
             break
 
-    # compute the mean of the map
-    loss_map = _mean_map(loss_map)                                             # reduce the map to get actual means
+    # compute the mean of the dict
+    loss_map = tree.map_structure(
+        lambda v: v / (num_minibatches + 1), loss_map)                          # reduce the map to get actual means
 
     # log some stuff
     to_log = '{}-{}[Epoch {}][{} samples][{:.2f} sec]:\t Loss: {:.4f}\t-ELBO: {:.4f}\tNLL: {:.4f}\tKLD: {:.4f}\tMI: {:.4f}'
