@@ -361,6 +361,7 @@ def lazy_generate_modules(model, loader):
                 raise ValueError("Minibatch max > 1.0 or minibatch min < 0. You probably dont want this.")
 
             minibatch = minibatch.cuda(non_blocking=True) if args.cuda else minibatch
+            labels = labels.cuda(non_blocking=True) if args.cuda else labels
             _ = model(minibatch, labels=labels)
             break
 
