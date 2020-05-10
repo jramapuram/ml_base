@@ -42,6 +42,8 @@ parser.add_argument('--image-size-override', type=int, default=None,
                     help='Override and force resizing of images to this specific size (default: None)')
 parser.add_argument('--data-dir', type=str, default='./.datasets', metavar='DD',
                     help='directory which contains input data')
+parser.add_argument('--log-dir', type=str, default='./runs',
+                    help='directory to store logs to (default: ./runs)')
 parser.add_argument('--uid', type=str, default="",
                     help='uid for current session (default: empty-str)')
 
@@ -331,9 +333,11 @@ def build_loader_model_grapher(args):
     if args.visdom_url is not None and args.distributed_rank == 0:
         grapher = Grapher('visdom', env=utils.get_name(args),
                           server=args.visdom_url,
-                          port=args.visdom_port)
+                          port=args.visdom_port,
+                          log_folder=args.log_dir)
     elif args.distributed_rank == 0:
-        grapher = Grapher('tensorboard', logdir=os.path.join('runs', utils.get_name(args)))
+        grapher = Grapher(
+            'tensorboard', logdir=os.path.join(args.log_dir, utils.get_name(args)))
 
     return loader, network, grapher
 
@@ -662,10 +666,6 @@ def run(rank, args):
                 config_to_post['slurm_job_id'] = slurm_id
 
             grapher.add_text('config', pprint.PrettyPrinter(indent=4).pformat(config_to_post), 0)
-
-    # cleanups
-    if grapher is not None:
-        grapher.close()
 
 
 if __name__ == "__main__":
