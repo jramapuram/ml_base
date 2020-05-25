@@ -464,12 +464,13 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
         lambda v: v / (num_minibatches + 1), loss_map)                          # reduce the map to get actual means
 
     # log some stuff
+    def tensor2item(t): return t.detach().item() if isinstance(t, torch.Tensor) else t
     to_log = '{}-{}[Epoch {}][{} samples][{:.2f} sec]:\t Loss: {:.4f}\tTop-1: {:.4f}\tTop-5: {:.4f}'
     print(to_log.format(
         prefix, args.distributed_rank, epoch, num_samples, time.time() - start_time,
-        loss_map['loss_mean'].item(),
-        loss_map['top1_mean'].item(),
-        loss_map['top5_mean'].item()))
+        tensor2item(loss_map['loss_mean']),
+        tensor2item(loss_map['top1_mean']),
+        tensor2item(loss_map['top5_mean'])))
 
     # plot the test accuracy, loss and images
     register_plots({**loss_map}, grapher, epoch=epoch, prefix=prefix)
@@ -485,7 +486,7 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
         grapher.save()
 
     # cleanups (see https://tinyurl.com/ycjre67m) + return loss for early stopping
-    loss_val = loss_map['loss_mean'].detach().item()
+    loss_val = tensor2item(loss_map['loss_mean'])
     loss_map.clear()
     return loss_val
 

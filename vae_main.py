@@ -462,7 +462,10 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
             else:
                 pred_logits, reparam_map = model(minibatch, labels=labels)     # get normal predictions
 
-            loss_t = model.loss_function(pred_logits, minibatch, reparam_map,  # compute loss
+            # compute loss
+            loss_t = model.loss_function(recon_x=pred_logits,
+                                         x=minibatch,
+                                         params=reparam_map,
                                          K=args.monte_carlo_posterior_samples)
             loss_map = loss_t if not loss_map else tree.map_structure(         # aggregate loss
                 _extract_sum_scalars, loss_map, loss_t)
@@ -495,14 +498,15 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
         lambda v: v / (num_minibatches + 1), loss_map)                          # reduce the map to get actual means
 
     # log some stuff
+    def tensor2item(t): return t.detach().item() if isinstance(t, torch.Tensor) else t
     to_log = '{}-{}[Epoch {}][{} samples][{:.2f} sec]:\t Loss: {:.4f}\t-ELBO: {:.4f}\tNLL: {:.4f}\tKLD: {:.4f}\tMI: {:.4f}'
     print(to_log.format(
         prefix, args.distributed_rank, epoch, num_samples, time.time() - start_time,
-        loss_map['loss_mean'].item(),
-        loss_map['elbo_mean'].item(),
-        loss_map['nll_mean'].item(),
-        loss_map['kld_mean'].item(),
-        loss_map['mut_info_mean'].item()))
+        tensor2item(loss_map['loss_mean']),
+        tensor2item(loss_map['elbo_mean']),
+        tensor2item(loss_map['nll_mean']),
+        tensor2item(loss_map['kld_mean']),
+        tensor2item(loss_map['mut_info_mean'])))
 
     # activate the logits of the reconstruction and get the dict
     reconstr_map = model.get_activated_reconstructions(pred_logits)
@@ -538,7 +542,7 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
         grapher.save()
 
     # cleanups (see https://tinyurl.com/ycjre67m) + return ELBO for early stopping
-    loss_val = loss_map['elbo_mean'].detach().item()
+    loss_val = tensor2item(loss_map['elbo_mean'])
     for d in [loss_map, image_map, reparam_map, reparam_scalars]:
         d.clear()
 
