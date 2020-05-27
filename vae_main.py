@@ -74,6 +74,8 @@ parser.add_argument('--encoder-layer-type', type=str, default='conv',
                     help='dense / resnet / conv (default: conv)')
 parser.add_argument('--decoder-layer-type', type=str, default='conv',
                     help='dense / conv / coordconv (default: conv)')
+parser.add_argument('--layer-modifier', type=str, default='none',
+                    help='none / spectral_norm / gated (default: none)')
 parser.add_argument('--activation', type=str, default='elu',
                     help='default activation function (default: elu)')
 parser.add_argument('--weight-initialization', type=str, default=None,
@@ -88,8 +90,6 @@ parser.add_argument('--decoder-base-channels', type=int, default=1024,
                     help='number of initial conv filter maps (default: 1024)')
 parser.add_argument('--decoder-channel-multiplier', type=float, default=0.5,
                     help='shrinks channels by this per layer (default: 0.5)')
-parser.add_argument('--disable-gated', action='store_true', default=False,
-                    help='disables gated convolutional or dense structure (default: False)')
 parser.add_argument('--model-dir', type=str, default='.models',
                     help='directory which contains saved models (default: .models)')
 
@@ -514,7 +514,7 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     # tack on MSSIM information if requested
     if args.calculate_msssim:
         loss_map['ms_ssim_mean'] = metrics.compute_mssim(
-            reconstr_map['reconstruction_imgs'], minibatch)
+            minibatch, reconstr_map['reconstruction_imgs'])
 
     # gather scalar values of reparameterizers (if they exist)
     reparam_scalars = model.get_reparameterizer_scalars()
