@@ -70,6 +70,8 @@ parser.add_argument('--use-aggregate-posterior', action='store_true', default=Fa
                     help='uses aggregate posterior for generation (default: False)')
 
 # Model
+parser.add_argument('--jit', action='store_true', default=False,
+                    help='torch-script the model (default: False)')
 parser.add_argument('--encoder-layer-type', type=str, default='conv',
                     help='dense / resnet / conv (default: conv)')
 parser.add_argument('--decoder-layer-type', type=str, default='conv',
@@ -542,7 +544,8 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
         grapher.save()
 
     # cleanups (see https://tinyurl.com/ycjre67m) + return ELBO for early stopping
-    loss_val = tensor2item(loss_map['elbo_mean'])
+    loss_val = tensor2item(loss_map['elbo_mean']) if args.vae_type != 'autoencoder' \
+        else tensor2item(loss_map['nll_mean'])
     for d in [loss_map, image_map, reparam_map, reparam_scalars]:
         d.clear()
 

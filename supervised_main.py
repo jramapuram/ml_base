@@ -57,6 +57,8 @@ parser.add_argument('--uid', type=str, default="",
 # Model related
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18', choices=model_names,
                     help='model architecture: ' + ' | '.join(model_names) + ' (default: resnet18)')
+parser.add_argument('--jit', action='store_true', default=False,
+                    help='torch-script the model (default: False)')
 parser.add_argument('--pretrained', action='store_true', default=False,
                     help='pull pretrained model weights (default: False)')
 parser.add_argument('--weight-initialization', type=str, default=None,
@@ -277,6 +279,7 @@ def build_loader_model_grapher(args):
     # build the network
     network = models.__dict__[args.arch](pretrained=args.pretrained, num_classes=loader.output_size)
     network = nn.SyncBatchNorm.convert_sync_batchnorm(network) if args.convert_to_sync_bn else network
+    network = torch.jit.script(network) if args.jit else network
     network = network.cuda() if args.cuda else network
     lazy_generate_modules(network, loader.train_loader)
     network = layers.init_weights(network, init=args.weight_initialization)
