@@ -29,13 +29,16 @@ RUN /opt/conda/bin/conda install numpy pandas scipy scikit-image scikit-learn h5
 
 # install misc conda / pip deps
 # consider installing jax jaxlib tensorflow-gpu==1.14
-RUN /opt/conda/bin/pip install torchvision tqdm msgpack joblib visdom rpyc \
-    pyro-ppl tensorboardX psutil dm-tree tensorflow==1.14 && \
+RUN /opt/conda/bin/pip install torchvision torchlayers torchsummary \
+        tqdm msgpack joblib visdom rpyc pyro-ppl tensorboardX psutil \
+        dm-tree tensorboard gitpython pytorch-msssim && \
     /opt/conda/bin/conda install -c defaults libprotobuf protobuf
 
 # install apex & cleanup
 RUN git clone --recursive https://github.com/NVIDIA/apex /opt/apex && \
-    cd /opt/apex && /opt/conda/bin/pip install -v --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" ./
+        cd /opt/apex && /opt/conda/bin/pip install -v --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" ./
+# RUN git clone --recursive https://github.com/NVIDIA/apex /opt/apex && \
+#         cd /opt/apex && git checkout f3a960f && /opt/conda/bin/pip install -v --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" ./
 
 WORKDIR /workspace
 RUN chmod -R a+w /workspace #&& chmod -R a+rwx /opt/conda
