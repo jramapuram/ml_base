@@ -66,8 +66,8 @@ parser.add_argument('--discrete-mut-info', type=float, default=0.0,
                     help='+discrete_mut_info * I(z_d; x) is applied (default: 0.0)')
 parser.add_argument('--generative-scale-var', type=float, default=1.0,
                     help='scale variance of prior in order to capture outliers')
-parser.add_argument('--use-aggregate-posterior', action='store_true', default=False,
-                    help='uses aggregate posterior for generation (default: False)')
+parser.add_argument('--aggregate-posterior-ema-decay', type=float, default=0.9,
+                    help='decay for the EMA based aggregate posterior (default: 0.9)')
 
 # Model
 parser.add_argument('--jit', action='store_true', default=False,
@@ -486,8 +486,8 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
                 # torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
                 nn.utils.clip_grad_value_(model.parameters(), args.clip)
 
-            optimizer.step()
-            if args.polyak_ema > 0:                                            # update Polyak mean if requested
+            optimizer.step()                                                   # update the parameters
+            if args.polyak_ema > 0:                                            # update Polyak EMA if requested
                 layers.polyak_ema_parameters(model, args.polyak_ema)
 
             del loss_t
@@ -524,20 +524,17 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     # plot the test accuracy, loss and images
     register_plots({**loss_map, **reparam_scalars}, grapher, epoch=epoch, prefix=prefix)
 
-    # get some generations, only do once in a while for pixelcnn
-    generated = None
-    if args.vae_type == 'pixelvae' and epoch % 10 == 0:
-        generated = model.generate_synthetic_samples(args.batch_size, reset_state=True,
-                                                     use_aggregate_posterior=args.use_aggregate_posterior)
-    else:
-        generated = model.generate_synthetic_samples(args.batch_size, reset_state=True,
-                                                     # override_noisy_state=True,
-                                                     use_aggregate_posterior=args.use_aggregate_posterior)
-
     # tack on images to grapher
     image_map = {'input_imgs': minibatch}
-    if generated is not None:
-        image_map['generated_imgs'] = generated
+
+    # Add generations to our image dict
+    with torch.no_grad():
+        prior_generated = model.generate_synthetic_samples(args.batch_size, reset_state=True,
+                                                           use_aggregate_posterior=False)
+        ema_generated = model.generate_synthetic_samples(args.batch_size, reset_state=True,
+                                                         use_aggregate_posterior=True)
+        image_map['prior_generated_imgs'] = prior_generated
+        image_map['ema_generated_imgs'] = ema_generated
 
     register_images({**image_map, **reconstr_map}, grapher, prefix=prefix)
     if grapher is not None:

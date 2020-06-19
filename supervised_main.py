@@ -338,7 +338,7 @@ def lazy_generate_modules(model, loader):
             break
 
     # initialize the polyak-ema op if it exists
-    if hasattr(model, 'polyak_ema') and args.polyak_ema > 0:
+    if args.polyak_ema > 0:
         layers.polyak_ema_parameters(model, args.polyak_ema)
 
 
@@ -453,8 +453,8 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
                 # torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
                 nn.utils.clip_grad_value_(model.parameters(), args.clip)
 
-            optimizer.step()
-            if args.polyak_ema > 0:                                            # update Polyak mean if requested
+            optimizer.step()                                                     # update the parameters
+            if args.polyak_ema > 0:                                              # update Polyak EMA if requested
                 layers.polyak_ema_parameters(model, args.polyak_ema)
 
             del loss_t
