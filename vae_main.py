@@ -372,7 +372,7 @@ def lazy_generate_modules(model, loader):
             break
 
     # initialize the polyak-ema op if it exists
-    if hasattr(model, 'polyak_ema') and args.polyak_ema > 0:
+    if args.polyak_ema > 0:
         layers.polyak_ema_parameters(model, args.polyak_ema)
 
 
