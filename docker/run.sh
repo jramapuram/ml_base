@@ -20,10 +20,11 @@ if [ $PORT == 0 ]; then
     # execute it in docker
     nvidia-docker run --ipc=host \
                   -v $HOME/datasets:/datasets \
-                  -v $HOME/models:/models \
+                  -v /experiments/models:/models \
+                  -v /experiments/logs:/logs \
                   -v ${ROOT_DIR}:/workspace \
                   -e NVIDIA_VISIBLE_DEVICES=$GPU \
-                  -it jramapuram/pytorch:1.5.0-cuda10.1 $CMD ;
+                  -it jramapuram/pytorch:1.5.1-cuda10.1 $CMD ;
 else
     # share the requested ports
     echo "exposing port: $PORT"
@@ -31,9 +32,10 @@ else
     # execute it in docker
     nvidia-docker run --ipc=host \
                   -v $HOME/datasets:/datasets \
-                  -v $HOME/models:/models \
+                  -v /experiments/models:/models \
+                  -v /experiments/logs:/logs \
                   -v ${ROOT_DIR}:/workspace \
                   -p $PORT:$PORT \
                   -e NVIDIA_VISIBLE_DEVICES=$GPU \
-                  -it jramapuram/pytorch:1.5.0-cuda10.1 $CMD ;
+                  -it jramapuram/pytorch:1.5.1-cuda10.1 $CMD ;
 fi

@@ -74,11 +74,15 @@ parser.add_argument('--jit', action='store_true', default=False,
                     help='torch-script the model (default: False)')
 parser.add_argument('--encoder-layer-type', type=str, default='conv',
                     help='dense / resnet / conv (default: conv)')
+parser.add_argument('--encoder-layer-modifier', type=str, default='none',
+                    help='none / spectral_norm / gated (default: none)')
+parser.add_argument('--encoder-activation', type=str, default='elu',
+                    help='default activation function (default: elu)')
 parser.add_argument('--decoder-layer-type', type=str, default='conv',
                     help='dense / conv / coordconv (default: conv)')
-parser.add_argument('--layer-modifier', type=str, default='none',
+parser.add_argument('--decoder-layer-modifier', type=str, default='none',
                     help='none / spectral_norm / gated (default: none)')
-parser.add_argument('--activation', type=str, default='elu',
+parser.add_argument('--decoder-activation', type=str, default='elu',
                     help='default activation function (default: elu)')
 parser.add_argument('--weight-initialization', type=str, default=None,
                     help='weight initialization type; None uses default pytorch init. (default: None)')
@@ -88,7 +92,7 @@ parser.add_argument('--encoder-base-channels', type=int, default=32,
                     help='number of initial conv filter maps (default: 32)')
 parser.add_argument('--encoder-channel-multiplier', type=int, default=2,
                     help='grow channels by this per layer (default: 2)')
-parser.add_argument('--decoder-base-channels', type=int, default=1024,
+parser.add_argument('--decoder-base-channels', type=int, default=256,
                     help='number of initial conv filter maps (default: 1024)')
 parser.add_argument('--decoder-channel-multiplier', type=float, default=0.5,
                     help='shrinks channels by this per layer (default: 0.5)')
@@ -398,11 +402,12 @@ def register_plots(loss, grapher, epoch, prefix='train'):
                 grapher.add_scalar('{}_{}'.format(prefix, key_name), value, epoch)
 
 
-def register_images(output_map, grapher, prefix='train'):
+def register_images(output_map, grapher, epoch, prefix='train'):
     """ Registers image with grapher. Overwrites the existing image due to space.
 
     :param output_map: the dict containing '*_img' of '*_imgs' as keys
     :param grapher: the grapher object
+    :param epoch: the current epoch
     :param prefix: prefix to attach to images
     :returns: None
     :rtype: None
@@ -416,9 +421,14 @@ def register_images(output_map, grapher, prefix='train'):
             if 'img' in k or 'imgs' in k:
                 key_name = '-'.join(k.split('_')[0:-1])
                 img = torchvision.utils.make_grid(v, normalize=True, scale_each=True)
+
+                # specify the keyword-args to the image plotter
+                kwargs = {'global_step': epoch}
+                if args.visdom_url is not None:
+                    kwargs['store_history'] = 'reconstruction' in key_name or 'generated' in key_name
+
                 grapher.add_image('{}_{}'.format(prefix, key_name),
-                                  img.detach(),
-                                  global_step=0)  # dont use step
+                                  img.detach().cpu(), **kwargs)
 
 
 def _extract_sum_scalars(v1, v2):
@@ -536,7 +546,7 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
         image_map['prior_generated_imgs'] = prior_generated
         image_map['ema_generated_imgs'] = ema_generated
 
-    register_images({**image_map, **reconstr_map}, grapher, prefix=prefix)
+    register_images({**image_map, **reconstr_map}, grapher, epoch=epoch, prefix=prefix)
     if grapher is not None:
         grapher.save()
 
