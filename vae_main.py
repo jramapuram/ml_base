@@ -416,7 +416,7 @@ def register_images(output_map, grapher, epoch, prefix='train'):
     if args.distributed_rank == 0 and grapher is not None:  # Only send stuff to visdom once.
         for k, v in output_map.items():
             if isinstance(v, dict):
-                register_images(output_map[k], grapher, prefix=prefix)
+                register_images(output_map[k], grapher, epoch=epoch, prefix=prefix)
 
             if 'img' in k or 'imgs' in k:
                 key_name = '-'.join(k.split('_')[0:-1])
