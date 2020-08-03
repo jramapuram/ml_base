@@ -24,7 +24,7 @@ if [ $PORT == 0 ]; then
                   -v /experiments/logs:/logs \
                   -v ${ROOT_DIR}:/workspace \
                   -e NVIDIA_VISIBLE_DEVICES=$GPU \
-                  -it jramapuram/pytorch:1.5.1-cuda10.1 $CMD ;
+                  -it jramapuram/pytorch:1.6.0-cuda10.1 $CMD ;
 else
     # share the requested ports
     echo "exposing port: $PORT"
@@ -37,5 +37,5 @@ else
                   -v ${ROOT_DIR}:/workspace \
                   -p $PORT:$PORT \
                   -e NVIDIA_VISIBLE_DEVICES=$GPU \
-                  -it jramapuram/pytorch:1.5.1-cuda10.1 $CMD ;
+                  -it jramapuram/pytorch:1.6.0-cuda10.1 $CMD ;
 fi

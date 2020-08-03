@@ -21,8 +21,9 @@ import optimizers.scheduler as scheduler
 
 from models.vae import build_vae
 from datasets.loader import get_loader
+from datasets.utils import get_numpy_dataset
 from helpers.grapher import Grapher
-from helpers.fid_client import FIDClient
+from helpers.metrics_client import MetricsClient
 from optimizers.lars import LARS
 
 
@@ -128,8 +129,8 @@ parser.add_argument('--add-img-noise', action='store_true', default=False,
 # Metrics
 parser.add_argument('--calculate-msssim', action='store_true', default=False,
                     help='enables MS-SSIM (default: False)')
-parser.add_argument('--fid-server', type=str, default=None,
-                    help='fid server url with port;  eg: myhost:8000 (default: None)')
+parser.add_argument('--metrics-server', type=str, default=None,
+                    help='remote metrics server url with port;  eg: myhost:8000 (default: None)')
 
 # Optimization related
 parser.add_argument('--lr', type=float, default=4e-4, metavar='LR',
@@ -334,6 +335,16 @@ def build_loader_model_grapher(args):
         utils.number_of_parameters(network) / 1e6
     ))
 
+    # add the test set as a np array for metrics calc
+    if args.metrics_server is not None:
+        network.test_images = get_numpy_dataset(task=args.task,
+                                                data_dir=args.data_dir,
+                                                test_transform=test_transform,
+                                                split='test',
+                                                image_size=args.image_size_override,
+                                                cuda=args.cuda)
+        print("Metrics test images: ", network.test_images.shape)
+
     # build the grapher object
     grapher = None
     if args.visdom_url is not None and args.distributed_rank == 0:
@@ -380,13 +391,14 @@ def lazy_generate_modules(model, loader):
         layers.polyak_ema_parameters(model, args.polyak_ema)
 
 
-def register_plots(loss, grapher, epoch, prefix='train'):
+def register_plots(loss, grapher, epoch, prefix='train', force_sync=False):
     """ Registers line plots with grapher.
 
     :param loss: the dict containing '*_mean' or '*_scalar' values
     :param grapher: the grapher object
     :param epoch: the current epoch
     :param prefix: prefix to append to the plot
+    :param force_sync: force a sync function call
     :returns: None
     :rtype: None
 
@@ -399,7 +411,10 @@ def register_plots(loss, grapher, epoch, prefix='train'):
             if 'mean' in k or 'scalar' in k:
                 key_name = '-'.join(k.split('_')[0:-1])
                 value = v.item() if not isinstance(v, (float, np.float32, np.float64)) else v
-                grapher.add_scalar('{}_{}'.format(prefix, key_name), value, epoch)
+                if force_sync:
+                    grapher.sync_add_scalar('{}_{}'.format(prefix, key_name), value, epoch)
+                else:
+                    grapher.add_scalar('{}_{}'.format(prefix, key_name), value, epoch)
 
 
 def register_images(output_map, grapher, epoch, prefix='train'):
@@ -441,6 +456,43 @@ def _extract_sum_scalars(v1, v2):
     v1_detached = v1.detach() if chk(v1) else v1
     v2_detached = v2.detach() if chk(v2) else v2
     return v1_detached + v2_detached
+
+
+def request_remote_metrics_calc(epoch, model, grapher, prefix, post_every):
+    """Helper to request remote server to compute metrics every post_every epoch.
+
+    :param epoch: the current epoch
+    :param model: the model
+    :param grapher: the grapher object
+    :param prefix: train / test / val
+    :param post_every: epoch interval to request metrics calculation
+    :returns: nothing, asynchronously calls back the lbda function when complete
+    :rtype: None
+
+    """
+    assert hasattr(model, 'metrics_client') and model.metrics_client is not None, "Metrics client not created."
+    assert hasattr(model, 'test_images') and model.test_images is not None, "Metrics test images not setup."
+
+    # Generate samples and post to the remote server
+    if epoch > 0 and epoch % post_every == 0:
+        with torch.no_grad():
+            generated_imgs = model.generate_synthetic_samples(batch_size=10000,
+                                                              reset_state=False,
+                                                              use_aggregate_posterior=False).transpose(1, -1)
+            assert generated_imgs.shape[0] == 10000, "need 10k generations for metrics, got {}.".format(
+                generated_imgs.shape)
+
+            # Build the lambda to post the images
+            def loss_lbda(metrics_map, epoch, prefix):
+                register_plots(metrics_map, grapher, epoch=epoch, prefix=prefix, force_sync=True)
+
+            # POST the true data and the fake data.
+            lbda = functools.partial(loss_lbda, epoch=epoch, prefix=prefix)
+            fake_images = generated_imgs.detach().cpu().numpy() if 'binarized' not in args.task \
+                else np.round(generated_imgs.detach().cpu().numpy())
+            model.metrics_client.post_with_images(fake_images=fake_images,
+                                                  real_images=model.test_images,
+                                                  lbda=lbda)
 
 
 def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
@@ -523,16 +575,12 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     # activate the logits of the reconstruction and get the dict
     reconstr_map = model.get_activated_reconstructions(pred_logits)
 
-    # tack on MSSIM information if requested
-    if args.calculate_msssim:
-        loss_map['ms_ssim_mean'] = metrics.compute_mssim(
-            minibatch, reconstr_map['reconstruction_imgs'])
+    # tack on remote metrics information if requested, do it in-frequently.
+    if args.metrics_server is not None and not is_eval:  # only eval train generations due to BN
+        request_remote_metrics_calc(epoch, model, grapher, prefix, post_every=20)
 
     # gather scalar values of reparameterizers (if they exist)
     reparam_scalars = model.get_reparameterizer_scalars()
-
-    # plot the test accuracy, loss and images
-    register_plots({**loss_map, **reparam_scalars}, grapher, epoch=epoch, prefix=prefix)
 
     # tack on images to grapher
     image_map = {'input_imgs': minibatch}
@@ -546,7 +594,19 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
         image_map['prior_generated_imgs'] = prior_generated
         image_map['ema_generated_imgs'] = ema_generated
 
-    register_images({**image_map, **reconstr_map}, grapher, epoch=epoch, prefix=prefix)
+        # tack on MSSIM information if requested
+        if args.calculate_msssim:
+            loss_map['prior_gen_msssim_mean'] = metrics.calculate_mssim(
+                minibatch, prior_generated)
+            loss_map['ema_gen_msssim_mean'] = metrics.calculate_mssim(
+                minibatch, ema_generated)
+
+    # plot the test accuracy, loss and images
+    register_plots({**loss_map, **reparam_scalars}, grapher, epoch=epoch, prefix=prefix)
+
+    def reduce_num_images(struct, num): return tree.map_structure(lambda v: v[0:num], struct)
+    register_images(reduce_num_images({**image_map, **reconstr_map}, num=64),
+                    grapher, epoch=epoch, prefix=prefix)
     if grapher is not None:
         grapher.save()
 
@@ -652,10 +712,10 @@ def run(rank, args):
     restore_dict = saver.restore()
     init_epoch = restore_dict['epoch']
 
-    # add the the fid model if requested
-    if args.fid_server is not None:
-        model.fid_client = FIDClient(host=args.fid_server.split(':')[0],
-                                     port=args.fid_server.split(':')[1])
+    # add the the metrics client as a member if requested
+    if args.metrics_server is not None:
+        model.metrics_client = MetricsClient(host=args.metrics_server.split(':')[0],
+                                             port=args.metrics_server.split(':')[1])
 
     # main training loop
     for epoch in range(init_epoch, args.epochs + 1):
@@ -711,3 +771,7 @@ if __name__ == "__main__":
     else:
         # Non-distributed launch
         run(rank=0, args=args)
+
+    if args.metrics_server is not None:
+        print("training complete! sleeping for 60 min for remote metrics to complete...")
+        time.sleep(60 * 60)

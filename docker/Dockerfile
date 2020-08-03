@@ -24,7 +24,7 @@ ENV PATH /opt/conda/bin:$PATH
 
 # install conda deps
 RUN /opt/conda/bin/conda install numpy pandas scipy scikit-image scikit-learn h5py matplotlib && \
-    /opt/conda/bin/conda install pytorch=1.5.1 torchvision cudatoolkit=10.1 -c pytorch && \
+    /opt/conda/bin/conda install pytorch=1.6.0 torchvision cudatoolkit=10.1 -c pytorch && \
     /opt/conda/bin/conda install -y -c conda-forge opencv pyvips
 
 # install misc conda / pip deps
