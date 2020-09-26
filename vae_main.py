@@ -417,7 +417,7 @@ def register_plots(loss, grapher, epoch, prefix='train', force_sync=False):
                     grapher.add_scalar('{}_{}'.format(prefix, key_name), value, epoch)
 
 
-def register_images(output_map, grapher, epoch, prefix='train'):
+def register_images(output_map, grapher, epoch, post_every=5, prefix='train'):
     """ Registers image with grapher. Overwrites the existing image due to space.
 
     :param output_map: the dict containing '*_img' of '*_imgs' as keys
@@ -428,7 +428,8 @@ def register_images(output_map, grapher, epoch, prefix='train'):
     :rtype: None
 
     """
-    if args.distributed_rank == 0 and grapher is not None:  # Only send stuff to visdom once.
+    is_posting_epoch = epoch > 0 and epoch % post_every == 0
+    if args.distributed_rank == 0 and grapher is not None and is_posting_epoch:  # Only send stuff to visdom once.
         for k, v in output_map.items():
             if isinstance(v, dict):
                 register_images(output_map[k], grapher, epoch=epoch, prefix=prefix)
@@ -561,16 +562,9 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     loss_map = tree.map_structure(
         lambda v: v / (num_minibatches + 1), loss_map)                          # reduce the map to get actual means
 
-    # log some stuff
-    def tensor2item(t): return t.detach().item() if isinstance(t, torch.Tensor) else t
-    to_log = '{}-{}[Epoch {}][{} samples][{:.2f} sec]:\t Loss: {:.4f}\t-ELBO: {:.4f}\tNLL: {:.4f}\tKLD: {:.4f}\tMI: {:.4f}'
-    print(to_log.format(
-        prefix, args.distributed_rank, epoch, num_samples, time.time() - start_time,
-        tensor2item(loss_map['loss_mean']),
-        tensor2item(loss_map['elbo_mean']),
-        tensor2item(loss_map['nll_mean']),
-        tensor2item(loss_map['kld_mean']),
-        tensor2item(loss_map['mut_info_mean'])))
+    # calculate the true likelihood by marginalizing out the latent variable
+    if epoch > 0 and epoch % 20 == 0 and is_eval:
+        loss_map['likelihood_mean'] = model.likelihood(loader, K=1000)
 
     # activate the logits of the reconstruction and get the dict
     reconstr_map = model.get_activated_reconstructions(pred_logits)
@@ -583,32 +577,45 @@ def execute_graph(epoch, model, loader, grapher, optimizer=None, prefix='test'):
     reparam_scalars = model.get_reparameterizer_scalars()
 
     # tack on images to grapher
+    post_images_every = 5  # TODO(jramapuram): parameterize
     image_map = {'input_imgs': minibatch}
 
     # Add generations to our image dict
-    with torch.no_grad():
-        prior_generated = model.generate_synthetic_samples(args.batch_size, reset_state=True,
-                                                           use_aggregate_posterior=False)
-        ema_generated = model.generate_synthetic_samples(args.batch_size, reset_state=True,
-                                                         use_aggregate_posterior=True)
-        image_map['prior_generated_imgs'] = prior_generated
-        image_map['ema_generated_imgs'] = ema_generated
+    if epoch > 0 and epoch % post_images_every == 0:
+        with torch.no_grad():
+            prior_generated = model.generate_synthetic_samples(args.batch_size, reset_state=True,
+                                                               use_aggregate_posterior=False)
+            ema_generated = model.generate_synthetic_samples(args.batch_size, reset_state=True,
+                                                             use_aggregate_posterior=True)
+            image_map['prior_generated_imgs'] = prior_generated
+            image_map['ema_generated_imgs'] = ema_generated
 
-        # tack on MSSIM information if requested
-        if args.calculate_msssim:
-            loss_map['prior_gen_msssim_mean'] = metrics.calculate_mssim(
-                minibatch, prior_generated)
-            loss_map['ema_gen_msssim_mean'] = metrics.calculate_mssim(
-                minibatch, ema_generated)
+            # tack on MSSIM information if requested
+            if args.calculate_msssim:
+                loss_map['prior_gen_msssim_mean'] = metrics.calculate_mssim(
+                    minibatch, prior_generated)
+                loss_map['ema_gen_msssim_mean'] = metrics.calculate_mssim(
+                    minibatch, ema_generated)
 
     # plot the test accuracy, loss and images
     register_plots({**loss_map, **reparam_scalars}, grapher, epoch=epoch, prefix=prefix)
 
     def reduce_num_images(struct, num): return tree.map_structure(lambda v: v[0:num], struct)
     register_images(reduce_num_images({**image_map, **reconstr_map}, num=64),
-                    grapher, epoch=epoch, prefix=prefix)
+                    grapher, epoch=epoch, post_every=post_images_every, prefix=prefix)
     if grapher is not None:
         grapher.save()
+
+    # log some stuff
+    def tensor2item(t): return t.detach().item() if isinstance(t, torch.Tensor) else t
+    to_log = '{}-{}[Epoch {}][{} samples][{:.2f} sec]:\t Loss: {:.4f}\t-ELBO: {:.4f}\tNLL: {:.4f}\tKLD: {:.4f}\tMI: {:.4f}'
+    print(to_log.format(
+        prefix, args.distributed_rank, epoch, num_samples, time.time() - start_time,
+        tensor2item(loss_map['loss_mean']),
+        tensor2item(loss_map['elbo_mean']),
+        tensor2item(loss_map['nll_mean']),
+        tensor2item(loss_map['kld_mean']),
+        tensor2item(loss_map['mut_info_mean'])))
 
     # cleanups (see https://tinyurl.com/ycjre67m) + return ELBO for early stopping
     loss_val = tensor2item(loss_map['elbo_mean']) if args.vae_type != 'autoencoder' \
